@@ -7,6 +7,9 @@ requires-python = ">=3.13"
 dependencies = [
     # Upper-bounded: Apprise 2 changed notify()'s return type (see monitor.py).
     "apprise>=2,<3",
+    # Validates the environment at boot (Settings in monitor.py). Upper-bounded:
+    # BaseSettings moved out of pydantic in its last major.
+    "pydantic-settings>=2,<3",
 ]
 
 [dependency-groups]

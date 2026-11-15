@@ -1,0 +1,15 @@
+# The image copies only pyproject.toml, uv.lock, .python-version and monitor.py.
+# Keep the rest out of the build context, above all a local .env with real secrets.
+.git
+.github
+.claude
+.venv
+**/__pycache__
+.pytest_cache
+.ruff_cache
+.env
+.env.*
+docs
+tests
+*.md
+docker-compose.yml

@@ -13,6 +13,10 @@ ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never
 
+# Runs as this user, not root. Its home is writable for Apprise's cache; the app
+# writes nothing else but the heartbeat in /tmp, so no other directory is handed to it.
+RUN useradd --system --create-home --uid 10001 app
+
 WORKDIR /app
 
 # Dependencies first, so a code-only change reuses this layer.
@@ -22,4 +26,11 @@ RUN uv sync --locked --no-dev --no-install-project
 COPY monitor.py .
 
 ENV PATH="/app/.venv/bin:$PATH"
+
+# The commit this image was built from (image.yml passes it), logged at startup.
+# Last, so a new revision doesn't invalidate the layers above.
+ARG GIT_REVISION=unknown
+ENV GIT_REVISION=$GIT_REVISION
+
+USER app
 CMD ["python", "monitor.py"]
