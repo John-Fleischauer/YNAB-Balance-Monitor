@@ -17,8 +17,8 @@ Dockhand.
 | 0 Audit | done (this file) | | |
 | 1 Pipeline (+ uv, ruff, first tests) | done | #10 | by hand |
 | 2 Runtime | done | #13 | by hand, John watches |
-| 3 Boundaries (narrow) | in review | `fix/boundaries` | `automerge` |
-| 4 Agent docs | proposed | | `automerge` |
+| 3 Boundaries (narrow) | done | #14 | `automerge` |
+| 4 Agent docs | in review | `docs/agent-docs` | `automerge` |
 | 5 Design/copy | **n/a**: no UI (notifications only) | | |
 | 6 Stack | out unless John asks (Q7) | | |
 

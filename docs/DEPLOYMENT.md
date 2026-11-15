@@ -51,7 +51,7 @@ The stack supplies them through Dockhand's stack environment, which compose inte
 the `environment:` list (`docker-compose.yml`). There's no `env_file`: a variable the compose
 file doesn't list never reaches the container. A missing required variable stops `compose up`
 with `set <NAME>`. The app validates the rest at boot (`Settings` in `monitor.py`) and exits 1
-with a readable error, never printing a value. A blank value counts as unset.
+with a readable error, never printing a secret's value (a bad schedule is quoted). A blank value counts as unset.
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
@@ -97,8 +97,8 @@ on `main`, or every later deploy keeps running the pinned image.
 
 In scheduled mode, once the scheduler is running, `docker stop` (SIGTERM) ends its wait at
 once: the log says `Shutting down...` and the process exits 0. A check already running
-makes no further YNAB request: it stops after the one in progress, or at once if it's waiting
-to retry, with no failure notification. Compose gives the stop 45 s (`stop_grace_period`), not
+makes no further YNAB request: the one in progress finishes and the check stops at its next
+request, or at once if it's waiting to retry, with no failure notification. Compose gives the stop 45 s (`stop_grace_period`), not
 Docker's default 10 s, because that one request can take up to 30 s. In run-once mode a stop ends the check where it is: the log says `Stopped
 before the check finished`, the process exits 143 and no failure notification goes out (a
 notification already being sent finishes or times out first: Apprise sends from a thread). A
@@ -131,8 +131,8 @@ waits for the next run; run-once mode exits 1 instead.
 The first failure in a row is notified: the `APPRISE_URLS` services get a "YNAB Balance
 Monitor failed" notification with the reason. Later failures of the same kind only log `Check
 still failing (<n> in a row); not notified again`. A different kind (a network error, then
-HTTP 401) is notified again, and so is the next failure if the last notification couldn't be
-sent. The first check that finishes after a notified failure sends one "YNAB Balance Monitor
+HTTP 401) is notified again. Only a notification that was sent records its kind, so after one
+that couldn't be sent the next failure is notified, unless it's the kind last notified. The first check that finishes after a notified failure sends one "YNAB Balance Monitor
 working again" notification. This state lives in memory: a restart starts again, so the first
 failure after a restart is notified even if the one before it was too. If a failure or
 recovery notification can't be sent, the log says `Could not send the failure notification`

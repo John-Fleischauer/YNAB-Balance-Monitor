@@ -1,28 +1,44 @@
 # YNAB Balance Monitor
 
-## Project overview
+A Python service that projects the minimum balance of one or more YNAB accounts through the end
+of the month (or `MONITOR_DAYS`) and notifies through Apprise: an alert below a threshold,
+routine updates, and a notice when a check fails. One file, `monitor.py`; Python 3.13 with uv;
+runs as a long-lived container with its own scheduler, or once and exits. Follows
+https://github.com/ki4hrg/standards (Python service profile). The `standards` plugin is enabled
+in `.claude/settings.json`; its `ship` skill is how work lands. How it works:
+`docs/ARCHITECTURE.md` · deploy and variables: `docs/DEPLOYMENT.md` · decisions:
+`docs/DECISIONS.md`.
 
-A lightweight Python tool that projects the minimum balance of one or more accounts through the end of the current month using YNAB data, and sends alerts via Apprise if the balance is projected to drop below a threshold. Designed for users who keep most cash in an HYSA and need early warning to transfer funds to checking.
+## Commands
 
-## Architecture
+- `uv sync`: the dev environment in `.venv`.
+- `uv run ruff check && uv run ruff format --check && uv run pytest`: all three pass before
+  anything is called done. CI runs the same.
+- One check against YNAB: `uv run --locked --env-file .env monitor.py`, with `.env` copied from
+  `.env.example` and `SCHEDULE` and `UPDATE_SCHEDULE` left empty. It sends real notifications.
 
-- **Single file**: `monitor.py` — all logic in one Python script (external dependencies: `apprise`, `pydantic-settings`)
-- **Docker**: `Dockerfile` + `docker-compose.yml` — runs as a long-lived service with built-in scheduling
-- **Config**: Environment variables via `stack.env` (Portainer) or `.env`
+## Rules that are easy to break
 
-## Key concepts
+- **Heartbeat.** Scheduled mode writes `/tmp/heartbeat` as the loop starts, from the sleep
+  loop and from retry waits (never from the rest of `run_cycle`), read by the compose healthcheck (10 min window).
+  A retry wait is a planned pause of up to 6 min a check, so it keeps the heartbeat fresh; a
+  hung network call must still let it go stale. Run-once mode exits and has no heartbeat.
+- **Unbuffered output.** The Dockerfile keeps `ENV PYTHONUNBUFFERED=1`: without it, `print`
+  output doesn't reach `docker logs` until a buffer fills.
+- **Guards.** The app has no inbound entry points; its inputs are the environment and YNAB's
+  replies, and the app's own variables are validated by `Settings` at boot.
 
-- **YNAB API** (`https://api.ynab.com/v1`): Amounts are in milliunits (1 dollar = 1000). Scheduled transactions use `date_next`/`date_first` fields (not `date`). Rate limit: 200 requests/hour.
-- **Recurrence expansion**: YNAB only returns the next occurrence of scheduled transactions. `_expand_occurrences()` generates all occurrences within the monitoring window for all 13 YNAB frequency types.
-- **CC payment deduplication**: Credit card payment category balances represent money earmarked to leave checking. Scheduled transfers to CC accounts are identified and subtracted to avoid double-counting. Remaining unscheduled CC payments are applied on day 1 (conservative).
-- **Multi-account monitoring**: Accounts are configured via `YNAB_ACCOUNT_ID_CC` (CC payments included) and `YNAB_ACCOUNT_ID_NO_CC` (CC payments excluded), with per-account balance thresholds. Format: `id:threshold,id2:threshold` (threshold defaults to 0 if omitted). Budget-wide data (scheduled transactions, CC categories) is fetched once per cycle and shared across accounts. Legacy single-account config (`YNAB_ACCOUNT_ID` + `MIN_BALANCE`) is still supported.
-- **Projection**: Day-by-day balance walk to find the minimum point, not just end-of-period balance.
+## Layout
 
-## Development notes
+- `monitor.py`: everything, in sections: log redaction, `Settings`, YNAB API (`ynab_get`,
+  retries), projection, notifications, `run_guarded_cycle`, scheduling and `main()`
+- `tests/`: pytest, YNAB and Apprise mocked or on localhost · `Dockerfile` · `docker-compose.yml` (the Dockhand
+  stack's file) · `.env.example`: every variable
+- `.github/workflows/ci.yml`: the standards' caller · `docs/plans/`: the standards sweep
+- `docs/claude-candidates.md`: proposed rules, not binding
 
-- Uses Python stdlib (`urllib`, `json`, `calendar`) plus `apprise` for notifications and `pydantic-settings` for the boot-time config check
-- `ENV PYTHONUNBUFFERED=1` in the Dockerfile for unbuffered output (required for Docker log visibility)
-- `stack.env` in docker-compose.yml for Portainer compatibility
-- `SCHEDULE` env var supports `HH:MM` (daily) or `Nh` (interval) formats
-- Image is built and pushed to GHCR by `.github/workflows/ci.yml`; compose only pulls (`pull_policy: always`), no `build:` block
-- Scheduled mode writes `/tmp/heartbeat` from the sleep loop and from retry waits (never from the rest of `run_cycle`), read by the compose HEALTHCHECK (10 min window). A retry wait is a planned pause of up to 6 min a check, so it keeps the heartbeat fresh; a hung network call must still let it go stale. Run-once mode exits and has no heartbeat
+## Exceptions to the standards
+
+Recorded in `docs/DECISIONS.md`: `monitor.py` stays a single file at the root; no
+`/api/health` (no HTTP; the revision is checked by hand); the compose file keeps the name
+`docker-compose.yml`; unversioned.
