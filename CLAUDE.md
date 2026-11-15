@@ -21,8 +21,8 @@ A lightweight Python tool that projects the minimum balance of one or more accou
 ## Development notes
 
 - Uses Python stdlib (`urllib`, `json`, `calendar`) plus `apprise` for notifications
-- `python -u` flag in Dockerfile for unbuffered output (required for Docker log visibility)
+- `ENV PYTHONUNBUFFERED=1` in the Dockerfile for unbuffered output (required for Docker log visibility)
 - `stack.env` in docker-compose.yml for Portainer compatibility
 - `SCHEDULE` env var supports `HH:MM` (daily) or `Nh` (interval) formats
-- Image is built and pushed to GHCR by `.github/workflows/build.yml`; compose only pulls (`pull_policy: always`), no `build:` block
+- Image is built and pushed to GHCR by `.github/workflows/ci.yml`; compose only pulls (`pull_policy: always`), no `build:` block
 - Scheduled mode writes `/tmp/heartbeat` from the sleep loop (never from `run_cycle`), read by the compose HEALTHCHECK (10 min window). Run-once mode exits and has no heartbeat
