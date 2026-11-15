@@ -116,7 +116,8 @@ A 429 with a `Retry-After` header (seconds or an HTTP date) waits that long inst
 `retrying in <n> s (YNAB's Retry-After)`. If it asks for more than 300 s, or more than the
 check's budget has left, the check fails at once (`YNAB asked for a <n> s wait, more than this
 check can wait`) and is notified as usual: YNAB's limit is 200 requests an hour, so waiting
-longer belongs to the next run. A missing or unreadable header gets the normal waits. Only the
+longer belongs to the next run. A missing or unreadable header, or a date that isn't in the future (clock skew), gets the
+normal waits. Only the
 parsed number of seconds is logged, never the header itself.
 
 In scheduled mode a retry wait writes the heartbeat at its start and every minute, so a long

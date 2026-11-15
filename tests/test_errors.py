@@ -726,7 +726,9 @@ def too_many_requests(retry_after=None):
         ("120", 120),
         (" 0 ", 0),
         ("Sun, 15 Nov 2026 12:02:00 GMT", 120),
-        ("Sun, 15 Nov 2026 11:59:00 GMT", 0),  # in the past
+        ("Sun, 15 Nov 2026 11:59:00 GMT", None),  # in the past: clock skew
+        ("99999999999", 99999999999),  # huge: fails the check at once
+        ("Mon, 1 Jan 99999999999999999999 00:00:00 GMT", None),
         (None, None),
         ("", None),
         ("soon", None),

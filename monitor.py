@@ -424,20 +424,26 @@ _stopping = bool
 
 def _retry_after_seconds(value, now=None):
     """Seconds a Retry-After header asks for (delay-seconds or an HTTP date), rounded
-    up; None if it's missing or neither form. Only this number is ever logged."""
+    up; None if it's missing, neither form, or a date that isn't in the future. Only
+    this number is ever logged.
+
+    A date already past is likely clock skew between YNAB and this host; retrying at
+    once would spend a retry for nothing, so it gets the normal waits instead.
+    """
     if value is None:
         return None
     value = value.strip()
-    if re.fullmatch(r"\d{1,10}", value):
-        return int(value)
+    if re.fullmatch(r"\d+", value):
+        return int(value)  # any size: a huge value just fails the check at once
     try:
         when = parsedate_to_datetime(value)
-    except (TypeError, ValueError, IndexError):
+        if when.tzinfo is None:  # "-0000": an HTTP date is GMT
+            when = when.replace(tzinfo=UTC)
+        seconds = (when - (now or datetime.now(UTC))).total_seconds()
+    except (TypeError, ValueError, IndexError, OverflowError):
+        # OverflowError: a year too large for datetime.
         return None
-    if when.tzinfo is None:  # "-0000": an HTTP date is GMT
-        when = when.replace(tzinfo=UTC)
-    seconds = (when - (now or datetime.now(UTC))).total_seconds()
-    return max(0, math.ceil(seconds))
+    return math.ceil(seconds) if seconds > 0 else None
 
 
 def _ynab_error_name(http_error):
