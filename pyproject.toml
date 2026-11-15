@@ -1,0 +1,21 @@
+[project]
+name = "ynab-balance-monitor"
+version = "0.0.0"
+description = "Projects the minimum balance of YNAB accounts and alerts via Apprise."
+license = "MIT"
+requires-python = ">=3.13"
+dependencies = [
+    # Upper-bounded: Apprise 2 changed notify()'s return type (see monitor.py).
+    "apprise>=2,<3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.14",
+]
+
+[tool.pytest.ini_options]
+# monitor.py is a single module at the repo root, not a package.
+pythonpath = ["."]
+testpaths = ["tests"]

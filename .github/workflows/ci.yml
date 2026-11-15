@@ -1,0 +1,123 @@
+name: ci
+
+# PR: check + security → image (build only) → merge-on-green (if labelled `automerge`)
+# main: check + security → image (build + push to GHCR) → deploy (Dockhand webhook)
+# For deploy mode B (service in another stack), drop `deploy` and publish on
+# version tags instead: standards docs/core/deploy.md.
+# A second image or lockfile (a worker): copy the `image` or `security` job once per
+# image or directory, and add every copy to automerge's `needs` and `require-jobs` and
+# to deploy's `needs` (docs/core/deploy.md, Several images or lockfiles).
+
+on:
+  push:
+    branches: [main]
+    # A docs-only direct push doesn't rebuild or redeploy. PRs always run (merge-on-green).
+    paths-ignore: ["docs/**", "**/*.md"]
+  pull_request:
+    # `labeled`: adding `automerge` to a PR whose checks already passed merges it.
+    types: [opened, synchronize, reopened, labeled, ready_for_review]
+  # merge-on-green dispatches this after merging; also a manual redeploy.
+  workflow_dispatch:
+    inputs:
+      # Set by merge-on-green when the merged tree is the one the PR run tested; check
+      # and security skip if it's still main's head. Leave it empty by hand.
+      tested:
+        type: string
+        default: ""
+
+# Superseded runs are cancelled on a PR, never on main. On main a running build always
+# finishes; a queued one can still be replaced by a newer commit's run (GitHub keeps one
+# pending run per group), which includes it, so not every main commit gets its own image.
+# A `labeled` run gets its own group per label, so it never cancels the run testing
+# the commit (or another label's run): Dependabot adds labels as it opens a PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && format('-label-{0}', github.event.label.name) || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # Skipped on `labeled`: adding a label never re-tests a commit (merge-on-green
+    # checks these passed in another run), and on a main run merge-on-green
+    # dispatched for exactly the tree the PR tested.
+    if: github.event.action != 'labeled' && !(github.event_name == 'workflow_dispatch' && inputs.tested == github.sha)
+    uses: ki4hrg/standards/.github/workflows/python-check.yml@v1
+    with:
+      # Private repos only: PR jobs (same-repo branches) run on the self-hosted runner
+      # when the repo variable PR_RUNNER names its label. main's runs stay on GitHub's
+      # runner unless MAIN_RUNNER names it, an override for stretching Actions minutes
+      # (docs/core/workflow.md).
+      runs-on: ${{ github.event.repository.private && (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.PR_RUNNER || github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.MAIN_RUNNER) || 'ubuntu-24.04' }}
+
+  security:
+    # Skipped on `labeled`: adding a label never re-tests a commit (merge-on-green
+    # checks these passed in another run), and on a main run merge-on-green
+    # dispatched for exactly the tree the PR tested.
+    if: github.event.action != 'labeled' && !(github.event_name == 'workflow_dispatch' && inputs.tested == github.sha)
+    uses: ki4hrg/standards/.github/workflows/security.yml@v1
+    with:
+      # Self-hosted when PR_RUNNER or MAIN_RUNNER is set, as in check.
+      runs-on: ${{ github.event.repository.private && (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.PR_RUNNER || github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.MAIN_RUNNER) || 'ubuntu-24.04' }}
+      package-managers: uv
+
+  image:
+    needs: [check, security]
+    # Runs when check and security passed or were skipped for an already-tested
+    # tree; never on `labeled`. A skipped need would otherwise skip it.
+    if: ${{ !cancelled() && !failure() && github.event.action != 'labeled' }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ki4hrg/standards/.github/workflows/image.yml@v1
+    with:
+      # As in check, but main's build and push use IMAGE_RUNNER: it holds a push token, so
+      # it moves to the self-hosted runner only by its own choice (docs/core/workflow.md).
+      runs-on: ${{ github.event.repository.private && (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.PR_RUNNER || github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.IMAGE_RUNNER) || 'ubuntu-24.04' }}
+      push: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+      platforms: linux/amd64
+
+  automerge:
+    needs: [check, security, image]
+    # Also on an `automerge` label run, where the jobs above are skipped.
+    if: ${{ !cancelled() && !failure() && github.event_name == 'pull_request' && (github.event.action != 'labeled' || github.event.label.name == 'automerge') }}
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write # dispatches this workflow on main after merging
+      checks: read # waits for app checks (GitGuardian); private repos need it
+    uses: ki4hrg/standards/.github/workflows/merge-on-green.yml@v1
+    with:
+      # paths-ignore above doesn't apply to the dispatch after a merge; this does.
+      skip-dispatch-paths: "docs/* *.md"
+      # On `labeled`, merge only if these passed on this commit in another run.
+      # Names must be jobs that call a workflow: a repo's own job (e2e) goes in
+      # a local `.github/workflows/<name>.yml` called with `uses: ./...`
+      # (docs/core/workflow.md, Merging).
+      require-jobs: check security image
+      # Let the main run skip checks for a tree the PR already tested (`tested` above).
+      pass-tested: true
+
+  # GitHub doesn't close "Closes #n" issues when GITHUB_TOKEN merges, so this does.
+  close-issues:
+    needs: automerge
+    if: ${{ !cancelled() && !failure() && needs.automerge.outputs.merged == 'true' }}
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    uses: ki4hrg/standards/.github/workflows/close-linked-issues.yml@v1
+
+  # No APP_HEALTH_URL: the app serves no HTTP, so the job can't check the running
+  # revision. The stack's Force redeploy and Re-pull images make `success: true` a real
+  # redeploy, a skipped one still fails the job, and the revision is checked by hand
+  # from the image label (docs/DECISIONS.md).
+  deploy:
+    needs: image
+    if: ${{ !cancelled() && !failure() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+    uses: ki4hrg/standards/.github/workflows/dockhand-deploy.yml@v1
+    # By name: `secrets: inherit` passes nothing to a workflow in another account.
+    secrets:
+      DOCKHAND_WEBHOOK_URL: ${{ secrets.DOCKHAND_WEBHOOK_URL }}
+      DOCKHAND_WEBHOOK_TOKEN: ${{ secrets.DOCKHAND_WEBHOOK_TOKEN }}

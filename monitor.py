@@ -2,23 +2,24 @@
 """YNAB Balance Monitor - Projects minimum account balances and alerts via Apprise."""
 
 import calendar
+import json
 import logging
 import os
 import signal
 import sys
-import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from datetime import datetime, timedelta, date
-from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import apprise
 
 # Surface Apprise's internal errors (network failures, auth errors, etc.)
-logging.basicConfig(stream=sys.stderr, level=logging.WARNING,
-                    format="%(name)s: %(message)s")
+logging.basicConfig(
+    stream=sys.stderr, level=logging.WARNING, format="%(name)s: %(message)s"
+)
 logging.getLogger("apprise").setLevel(logging.INFO)
 
 # ---------------------------------------------------------------------------
@@ -27,12 +28,20 @@ logging.getLogger("apprise").setLevel(logging.INFO)
 
 YNAB_API_TOKEN = os.environ.get("YNAB_API_TOKEN", "")
 YNAB_BUDGET_ID = os.environ.get("YNAB_BUDGET_ID", "last-used")
-YNAB_CC_CATEGORIES = os.environ.get("YNAB_CC_CATEGORIES", "")  # comma-separated IDs, empty = all
+YNAB_CC_CATEGORIES = os.environ.get(
+    "YNAB_CC_CATEGORIES", ""
+)  # comma-separated IDs, empty = all
 MONITOR_DAYS = os.environ.get("MONITOR_DAYS", "")  # empty = end of current month
 APPRISE_URLS = os.environ.get("APPRISE_URLS", "")  # comma-separated Apprise URLs
-SCHEDULE = os.environ.get("SCHEDULE", "")  # e.g. "08:00" for daily at 8am, "6h" for every 6 hours
-UPDATE_SCHEDULE = os.environ.get("UPDATE_SCHEDULE", "")  # when to send routine balance update notifications
-UPDATE_APPRISE_URLS = os.environ.get("UPDATE_APPRISE_URLS", "")  # defaults to APPRISE_URLS if empty
+SCHEDULE = os.environ.get(
+    "SCHEDULE", ""
+)  # e.g. "08:00" for daily at 8am, "6h" for every 6 hours
+UPDATE_SCHEDULE = os.environ.get(
+    "UPDATE_SCHEDULE", ""
+)  # when to send routine balance update notifications
+UPDATE_APPRISE_URLS = os.environ.get(
+    "UPDATE_APPRISE_URLS", ""
+)  # defaults to APPRISE_URLS if empty
 TZ = os.environ.get("TZ", "")
 
 YNAB_BASE = "https://api.ynab.com/v1"
@@ -68,21 +77,33 @@ def parse_account_configs():
     old_set = bool(legacy_raw)
 
     if old_set and new_set:
-        print("Error: Cannot use YNAB_ACCOUNT_ID alongside YNAB_ACCOUNT_ID_CC/YNAB_ACCOUNT_ID_NO_CC",
-              file=sys.stderr)
+        print(
+            "Error: Cannot use YNAB_ACCOUNT_ID alongside YNAB_ACCOUNT_ID_CC/YNAB_ACCOUNT_ID_NO_CC",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     if new_set:
         accounts = []
         for entry in _parse_account_entries(cc_raw):
-            accounts.append(AccountConfig(account_id=entry[0], min_balance=entry[1], include_cc=True))
+            accounts.append(
+                AccountConfig(
+                    account_id=entry[0], min_balance=entry[1], include_cc=True
+                )
+            )
         for entry in _parse_account_entries(no_cc_raw):
-            accounts.append(AccountConfig(account_id=entry[0], min_balance=entry[1], include_cc=False))
+            accounts.append(
+                AccountConfig(
+                    account_id=entry[0], min_balance=entry[1], include_cc=False
+                )
+            )
         return accounts
 
     if old_set:
         min_bal = int(os.environ.get("MIN_BALANCE", "0"))
-        return [AccountConfig(account_id=legacy_raw, min_balance=min_bal, include_cc=True)]
+        return [
+            AccountConfig(account_id=legacy_raw, min_balance=min_bal, include_cc=True)
+        ]
 
     return []
 
@@ -105,6 +126,7 @@ def _parse_account_entries(raw):
 # ---------------------------------------------------------------------------
 # YNAB API helpers
 # ---------------------------------------------------------------------------
+
 
 def ynab_get(path):
     """Make an authenticated GET request to the YNAB API."""
@@ -130,6 +152,7 @@ def milliunits_to_dollars(milliunits):
 # ---------------------------------------------------------------------------
 # Core logic
 # ---------------------------------------------------------------------------
+
 
 def get_end_date():
     """Compute the projection end date.
@@ -173,17 +196,17 @@ def _expand_occurrences(next_date, frequency, start, end):
     # Map YNAB frequency to a delta-generating function.
     # Each function returns the next date given the current one.
     DELTAS = {
-        "daily":          lambda d: d + timedelta(days=1),
-        "weekly":         lambda d: d + timedelta(weeks=1),
+        "daily": lambda d: d + timedelta(days=1),
+        "weekly": lambda d: d + timedelta(weeks=1),
         "everyOtherWeek": lambda d: d + timedelta(weeks=2),
-        "every4Weeks":    lambda d: d + timedelta(weeks=4),
-        "monthly":        lambda d: _add_months(d, 1),
-        "everyOtherMonth":lambda d: _add_months(d, 2),
-        "every3Months":   lambda d: _add_months(d, 3),
-        "every4Months":   lambda d: _add_months(d, 4),
-        "twiceAMonth":    None,  # special case
-        "twiceAYear":     lambda d: _add_months(d, 6),
-        "yearly":         lambda d: _add_months(d, 12),
+        "every4Weeks": lambda d: d + timedelta(weeks=4),
+        "monthly": lambda d: _add_months(d, 1),
+        "everyOtherMonth": lambda d: _add_months(d, 2),
+        "every3Months": lambda d: _add_months(d, 3),
+        "every4Months": lambda d: _add_months(d, 4),
+        "twiceAMonth": None,  # special case
+        "twiceAYear": lambda d: _add_months(d, 6),
+        "yearly": lambda d: _add_months(d, 12),
         "everyOtherYear": lambda d: _add_months(d, 24),
     }
 
@@ -248,7 +271,9 @@ def get_scheduled_transactions(all_scheduled, account_id, end_date):
         if txn.get("deleted", False):
             continue
 
-        next_date = datetime.strptime(txn.get("date_next") or txn.get("date_first", ""), "%Y-%m-%d").date()
+        next_date = datetime.strptime(
+            txn.get("date_next") or txn.get("date_first", ""), "%Y-%m-%d"
+        ).date()
         frequency = txn.get("frequency", "never")
         amount = milliunits_to_dollars(txn["amount"])
         payee = txn.get("payee_name", "Unknown")
@@ -257,14 +282,16 @@ def get_scheduled_transactions(all_scheduled, account_id, end_date):
         occurrences = _expand_occurrences(next_date, frequency, today, end_date)
         for occ_date in occurrences:
             freq_label = f" ({frequency})" if frequency != "never" else ""
-            transactions.append({
-                "date": occ_date,
-                "amount": amount,
-                "payee": payee,
-                "transfer_account_id": transfer_account_id,
-                "frequency": frequency,
-                "label": f"{payee}{freq_label}",
-            })
+            transactions.append(
+                {
+                    "date": occ_date,
+                    "amount": amount,
+                    "payee": payee,
+                    "transfer_account_id": transfer_account_id,
+                    "frequency": frequency,
+                    "label": f"{payee}{freq_label}",
+                }
+            )
 
     transactions.sort(key=lambda t: t["date"])
     print(f"\nScheduled transactions through {end_date}: {len(transactions)}")
@@ -283,7 +310,11 @@ def get_cc_payment_amounts(cc_categories_filter=""):
     accounts_data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/accounts")
     cc_accounts = {}
     for acct in accounts_data["accounts"]:
-        if acct["type"] == "creditCard" and not acct.get("deleted", False) and not acct.get("closed", False):
+        if (
+            acct["type"] == "creditCard"
+            and not acct.get("deleted", False)
+            and not acct.get("closed", False)
+        ):
             cc_accounts[acct["name"]] = acct["id"]
 
     # Get categories and find the Credit Card Payments group
@@ -302,7 +333,11 @@ def get_cc_payment_amounts(cc_categories_filter=""):
             if cat.get("deleted", False) or cat.get("hidden", False):
                 continue
             # If user specified specific categories, filter
-            if cc_filter and cat["id"] not in cc_filter and cat["name"] not in cc_filter:
+            if (
+                cc_filter
+                and cat["id"] not in cc_filter
+                and cat["name"] not in cc_filter
+            ):
                 continue
 
             available = milliunits_to_dollars(cat["balance"])
@@ -321,7 +356,9 @@ def get_cc_payment_amounts(cc_categories_filter=""):
     return cc_payments, total
 
 
-def project_minimum_balance(current_balance, scheduled_transactions, cc_payments, end_date):
+def project_minimum_balance(
+    current_balance, scheduled_transactions, cc_payments, end_date
+):
     """Walk day-by-day to find the minimum projected balance.
 
     CC payments that are already in scheduled_transactions (as transfers to CC
@@ -347,7 +384,9 @@ def project_minimum_balance(current_balance, scheduled_transactions, cc_payments
     # Unscheduled CC payment total — apply on day 1
     unscheduled_cc_total = sum(p["amount"] for p in remaining_cc.values())
     if unscheduled_cc_total > 0:
-        print(f"\nUnscheduled CC payments (applied today): ${unscheduled_cc_total:,.2f}")
+        print(
+            f"\nUnscheduled CC payments (applied today): ${unscheduled_cc_total:,.2f}"
+        )
 
     # Build day-by-day projection
     balance = current_balance - unscheduled_cc_total
@@ -377,14 +416,14 @@ def project_minimum_balance(current_balance, scheduled_transactions, cc_payments
 # Notification
 # ---------------------------------------------------------------------------
 
+
 def _build_notifier(urls_str):
     """Build an Apprise notifier from a comma-separated URL string."""
     notifier = apprise.Apprise()
     for url in urls_str.split(","):
         url = url.strip()
-        if url:
-            if not notifier.add(url):
-                print(f"Apprise: failed to load URL: {url[:40]}...", file=sys.stderr)
+        if url and not notifier.add(url):
+            print(f"Apprise: failed to load URL: {url[:40]}...", file=sys.stderr)
     return notifier
 
 
@@ -421,13 +460,17 @@ def send_alert_notification(min_balance, min_date, account_name, min_threshold):
         f"Minimum threshold: ${min_threshold:,.2f}."
     )
 
-    notify_type = apprise.NotifyType.FAILURE if min_balance < 0 else apprise.NotifyType.WARNING
+    notify_type = (
+        apprise.NotifyType.FAILURE if min_balance < 0 else apprise.NotifyType.WARNING
+    )
 
     if _send_notification(APPRISE_URLS, title, message, notify_type):
         print("\nAlert notification sent via Apprise")
 
 
-def send_update_notification(min_balance, min_date, end_date, account_name, min_threshold):
+def send_update_notification(
+    min_balance, min_date, end_date, account_name, min_threshold
+):
     """Send a routine projected-balance update via Apprise."""
     title = "YNAB Balance Update"
     status = "below threshold" if min_balance < min_threshold else "on track"
@@ -438,7 +481,11 @@ def send_update_notification(min_balance, min_date, end_date, account_name, min_
     )
 
     urls = UPDATE_APPRISE_URLS or APPRISE_URLS
-    notify_type = apprise.NotifyType.WARNING if min_balance < min_threshold else apprise.NotifyType.SUCCESS
+    notify_type = (
+        apprise.NotifyType.WARNING
+        if min_balance < min_threshold
+        else apprise.NotifyType.SUCCESS
+    )
 
     if _send_notification(urls, title, message, notify_type):
         print("\nUpdate notification sent via Apprise")
@@ -447,6 +494,7 @@ def send_update_notification(min_balance, min_date, end_date, account_name, min_
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def validate_config(accounts):
     """Check required configuration is present."""
@@ -482,38 +530,47 @@ def run_cycle(accounts, send_update=False):
 
     need_cc = any(a.include_cc for a in accounts)
     if need_cc:
-        cc_payments, cc_total = get_cc_payment_amounts(YNAB_CC_CATEGORIES)
+        cc_payments, _ = get_cc_payment_amounts(YNAB_CC_CATEGORIES)
     else:
-        cc_payments, cc_total = {}, 0
+        cc_payments = {}
 
     for acct in accounts:
         print(f"\n{'—' * 40}")
         balance, name = get_account_balance(acct.account_id)
         acct.name = name
 
-        transactions = get_scheduled_transactions(all_scheduled, acct.account_id, end_date)
+        transactions = get_scheduled_transactions(
+            all_scheduled, acct.account_id, end_date
+        )
 
         if acct.include_cc:
             acct_cc = cc_payments
         else:
             acct_cc = {}
 
-        min_balance, min_date = project_minimum_balance(balance, transactions, acct_cc, end_date)
+        min_balance, min_date = project_minimum_balance(
+            balance, transactions, acct_cc, end_date
+        )
 
         if min_balance < acct.min_balance:
             shortfall = acct.min_balance - min_balance
-            print(f"\n⚠ ALERT: {name} projected balance drops ${shortfall:,.2f} below threshold!")
+            print(
+                f"\n⚠ ALERT: {name} projected balance drops ${shortfall:,.2f} below threshold!"
+            )
             send_alert_notification(min_balance, min_date, name, acct.min_balance)
         else:
             print(f"\n✓ {name} stays above ${acct.min_balance:,.2f} threshold.")
 
         if send_update:
-            send_update_notification(min_balance, min_date, end_date, name, acct.min_balance)
+            send_update_notification(
+                min_balance, min_date, end_date, name, acct.min_balance
+            )
 
 
 # ---------------------------------------------------------------------------
 # Scheduling
 # ---------------------------------------------------------------------------
+
 
 def _parse_schedule(schedule):
     """Parse a schedule string into a descriptor tuple.
@@ -618,7 +675,11 @@ def main():
 
     if update_schedule:
         _describe_schedule("Update schedule", update_schedule)
-        next_update = now if update_schedule[0] == "interval" else _next_occurrence(update_schedule)
+        next_update = (
+            now
+            if update_schedule[0] == "interval"
+            else _next_occurrence(update_schedule)
+        )
     else:
         next_update = None
 
@@ -649,7 +710,9 @@ def main():
         # Run the projection (always checks alert threshold; optionally sends
         # an update notification when the update schedule fires, or on every
         # check when no separate UPDATE_SCHEDULE is configured).
-        run_cycle(accounts, send_update=do_update or (do_check and update_schedule is None))
+        run_cycle(
+            accounts, send_update=do_update or (do_check and update_schedule is None)
+        )
 
         if do_check and schedule:
             next_check = _next_occurrence(schedule)

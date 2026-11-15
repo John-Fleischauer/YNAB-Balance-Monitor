@@ -47,7 +47,7 @@ The container runs as a long-lived service and checks on your configured schedul
 docker compose run --rm monitor
 
 # Or without Docker:
-python monitor.py
+uv run --locked monitor.py   # installs the locked dependencies first
 ```
 
 ## Configuration
@@ -92,3 +92,7 @@ Projected minimum balance: $-250.00 on 2026-02-10
 ⚠ ALERT: Projected balance drops $750.00 below threshold!
 Notification sent to my-balance-alerts
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
