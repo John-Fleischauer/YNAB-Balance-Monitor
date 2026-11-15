@@ -2,17 +2,17 @@
 """YNAB Balance Monitor - Projects minimum account balances and alerts via Apprise."""
 
 import calendar
+import json
 import logging
 import os
 import signal
 import sys
-import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from datetime import datetime, timedelta, date
-from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import apprise
 
@@ -382,9 +382,8 @@ def _build_notifier(urls_str):
     notifier = apprise.Apprise()
     for url in urls_str.split(","):
         url = url.strip()
-        if url:
-            if not notifier.add(url):
-                print(f"Apprise: failed to load URL: {url[:40]}...", file=sys.stderr)
+        if url and not notifier.add(url):
+            print(f"Apprise: failed to load URL: {url[:40]}...", file=sys.stderr)
     return notifier
 
 
@@ -482,9 +481,9 @@ def run_cycle(accounts, send_update=False):
 
     need_cc = any(a.include_cc for a in accounts)
     if need_cc:
-        cc_payments, cc_total = get_cc_payment_amounts(YNAB_CC_CATEGORIES)
+        cc_payments, _ = get_cc_payment_amounts(YNAB_CC_CATEGORIES)
     else:
-        cc_payments, cc_total = {}, 0
+        cc_payments = {}
 
     for acct in accounts:
         print(f"\n{'—' * 40}")
