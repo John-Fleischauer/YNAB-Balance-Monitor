@@ -20,6 +20,7 @@ from urllib.parse import unquote
 from urllib.request import Request, urlopen
 
 import apprise
+from apprise.utils.parse import parse_urls
 from pydantic import (
     Field,
     PrivateAttr,
@@ -74,14 +75,17 @@ class _RedactSecrets(logging.Filter):
 
 
 def _split_urls(urls_str):
-    """The entries of an Apprise URL list, split as Apprise splits it: on commas,
-    semicolons and whitespace. Entry numbers in messages count from 1 in this list."""
-    return [url for url in re.split(r"[\s,;]+", urls_str) if url]
+    """The entries of an Apprise URL list, split by Apprise's own parser: on commas,
+    semicolons and whitespace, but only where the next entry starts with a scheme, so a
+    comma inside a URL (`mailto://…?to=a@x.com,b@x.com`) stays in it. Entry numbers in
+    messages count from 1 in this list."""
+    return parse_urls(urls_str)
 
 
 def _unloadable_entries(urls_str):
     """The numbers of the entries Apprise can't load. Apprise logs a URL it can't load,
     credentials and all, so logging is off while it tries."""
+    previous = logging.root.manager.disable
     logging.disable(logging.CRITICAL)
     try:
         return [
@@ -90,7 +94,7 @@ def _unloadable_entries(urls_str):
             if not apprise.Apprise().add(url)
         ]
     finally:
-        logging.disable(logging.NOTSET)
+        logging.disable(previous)
 
 
 def _check_urls_load(urls_str):
@@ -115,7 +119,7 @@ def _secret_parts(urls_str):
     for url in _split_urls(urls_str):
         parts.append(url)
         _, _, rest = url.partition("://")
-        for piece in re.split(r"[/:@?&=#]", rest):
+        for piece in re.split(r"[/:@?&=#,;\s]", rest):
             # Query keys get masked too; harmless, and simpler than parsing the query.
             for form in (piece, unquote(piece)):
                 if len(form) >= 6:
@@ -386,9 +390,12 @@ class YNABError(Exception):
     reply that isn't what YNAB sends, won't fix itself by waiting.
     """
 
-    def __init__(self, message, retryable=False):
+    def __init__(self, message, retryable=False, kind="reply"):
         super().__init__(message)
         self.retryable = retryable
+        # What went wrong, coarsely ("network", "HTTP 401"): a change of kind during
+        # an outage is notified again (run_guarded_cycle).
+        self.kind = kind
 
 
 def _sleep(seconds):
@@ -402,6 +409,9 @@ def _sleep(seconds):
 _retry_wait = _sleep
 # What's left of this cycle's RETRY_WAITS; run_guarded_cycle refills it.
 _retries_left = []
+# True once a stop is requested (the scheduled loop points it at its _Stop): the
+# check then makes no further YNAB request, so a stop doesn't wait out the whole check.
+_stopping = bool
 
 
 def _ynab_error_name(http_error):
@@ -422,9 +432,14 @@ def ynab_get(path, what):
     RETRY_WAITS last; a stop requested during a wait raises _Stopped.
     """
     while True:
+        if _stopping():
+            raise _Stopped(signal.SIGTERM)
         try:
             return _ynab_get_once(path, what)
         except YNABError as e:
+            if _stopping():
+                # Likely cut off by the stop itself: not a failure to report.
+                raise _Stopped(signal.SIGTERM) from None
             if not e.retryable or not _retries_left:
                 raise
             delay = _retries_left.pop(0)
@@ -446,22 +461,26 @@ def _ynab_get_once(path, what):
         raise YNABError(
             f"YNAB API error fetching {what}: HTTP {e.code}{detail}",
             retryable=e.code >= 500 or e.code == 429,
+            kind=f"HTTP {e.code}",
         ) from None
     except URLError as e:
         # e.reason is the socket error ("Name or service not known"), never the URL.
         raise YNABError(
-            f"Network error fetching {what}: {e.reason}", retryable=True
+            f"Network error fetching {what}: {e.reason}", retryable=True, kind="network"
         ) from None
     except TimeoutError:
         # A read that times out raises this directly, not wrapped in URLError.
         raise YNABError(
             f"Network error fetching {what}: no reply within {YNAB_TIMEOUT} s",
             retryable=True,
+            kind="network",
         ) from None
     except (OSError, HTTPException) as e:
         # A dropped connection or a short read: the type says enough.
         raise YNABError(
-            f"Network error fetching {what}: {type(e).__name__}", retryable=True
+            f"Network error fetching {what}: {type(e).__name__}",
+            retryable=True,
+            kind="network",
         ) from None
     except (ValueError, KeyError, TypeError):
         # Not JSON, or JSON without `data`: say so without echoing the body.
@@ -825,14 +844,15 @@ def send_update_notification(
 
 
 def send_failure_notification(reason, will_retry):
-    """Tell the alert URLs that a cycle failed. Never raises: a failure here is logged.
+    """Tell the alert URLs that a cycle failed; True if sent. Never raises: a failure
+    here is logged.
 
     `reason` must already be safe to send (no token, URLs or account IDs).
     """
     message = f"The balance check didn't finish: {reason}."
     if will_retry:
         message += " It runs again at the next scheduled time."
-    _send_status(
+    return _send_status(
         "failure",
         "YNAB Balance Monitor failed",
         message,
@@ -852,7 +872,8 @@ def send_recovery_notification(failures):
 
 
 def _send_status(kind, title, message, notify_type):
-    """Send a failure or recovery notice to APPRISE_URLS. Never raises: it's logged."""
+    """Send a failure or recovery notice to APPRISE_URLS; True if sent. Never raises:
+    a failure is logged."""
     try:
         sent = _send_notification(
             APPRISE_URLS, "APPRISE_URLS", title, message, notify_type
@@ -863,11 +884,12 @@ def _send_status(kind, title, message, notify_type):
             f"Could not send the {kind} notification: {type(e).__name__}",
             file=sys.stderr,
         )
-        return
+        return False
     if sent:
         print(f"{kind.capitalize()} notification sent via Apprise")
     else:
         print(f"Could not send the {kind} notification", file=sys.stderr)
+    return bool(sent)
 
 
 # ---------------------------------------------------------------------------
@@ -942,29 +964,40 @@ def _describe_failure(error):
     return f"unexpected {type(error).__name__}{where}"
 
 
-# Failed cycles in a row, in this process: a restart starts again from 0.
+def _failure_kind(error):
+    """What went wrong, coarsely: a YNABError's kind, or the exception's type."""
+    return error.kind if isinstance(error, YNABError) else type(error).__name__
+
+
+# This process's run of failed cycles: how many in a row, and the kind of failure last
+# notified (None: none notified yet). In memory: a restart starts again.
 _failures_in_a_row = 0
+_notified_kind = None
 
 
 def run_guarded_cycle(accounts, send_update=False, will_retry=True):
-    """Run one cycle; if it fails, log why, and notify if it's the first failure.
+    """Run one cycle; if it fails, log why, and notify unless it's already been told.
 
     The one place a cycle's errors are handled: a YNAB or network error, or a bug, ends
-    this cycle but never the scheduling loop. Only the first of a run of failures is
-    notified, and the first cycle that finishes after them sends a recovery notice, so
-    an outage doesn't flood the alert channel. Returns True if the cycle finished.
+    this cycle but never the scheduling loop. In a run of failures, a notification goes
+    out for the first one, and again only if the kind of failure changes (a network
+    error, then HTTP 401) or the last one couldn't be sent; the rest only log, so an
+    outage doesn't flood the alert channel. The first cycle that finishes after a
+    notified failure sends a recovery notice. Returns True if the cycle finished.
     A stop (_Stopped, a BaseException) passes through and counts as neither.
     """
-    global _retries_left, _failures_in_a_row
+    global _retries_left, _failures_in_a_row, _notified_kind
     _retries_left = list(RETRY_WAITS)
     try:
         run_cycle(accounts, send_update=send_update)
     except Exception as e:  # noqa: BLE001 -- the one handler for a cycle's errors
         reason = _describe_failure(e)
+        kind = _failure_kind(e)
         print(f"\nCheck failed: {reason}", file=sys.stderr)
         _failures_in_a_row += 1
-        if _failures_in_a_row == 1:
-            send_failure_notification(reason, will_retry)
+        if kind != _notified_kind:
+            if send_failure_notification(reason, will_retry):
+                _notified_kind = kind
         else:
             print(
                 f"Check still failing ({_failures_in_a_row} in a row); "
@@ -972,9 +1005,9 @@ def run_guarded_cycle(accounts, send_update=False, will_retry=True):
                 file=sys.stderr,
             )
         return False
-    if _failures_in_a_row:
+    if _notified_kind is not None:
         send_recovery_notification(_failures_in_a_row)
-        _failures_in_a_row = 0
+    _failures_in_a_row, _notified_kind = 0, None
     return True
 
 
@@ -1177,8 +1210,9 @@ def main():
     # finishes first.
     stop = _Stop()
     # A retry wait ends at once on a stop, like the wait between runs.
-    global _retry_wait
+    global _retry_wait, _stopping
     _retry_wait = stop.wait
+    _stopping = lambda: stop.requested
 
     # Determine initial next-run times.
     # Interval schedules fire immediately on startup; daily schedules wait for

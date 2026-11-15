@@ -38,6 +38,8 @@ def fresh_state(monkeypatch):
     """Each test starts with no failures counted, no retries left and a plain sleep;
     monkeypatch puts back whatever a test (or main()) changes."""
     monkeypatch.setattr(monitor, "_failures_in_a_row", 0)
+    monkeypatch.setattr(monitor, "_notified_kind", None)
+    monkeypatch.setattr(monitor, "_stopping", bool)
     monkeypatch.setattr(monitor, "_retries_left", [])
     monkeypatch.setattr(monitor, "_retry_wait", monitor._sleep)
 
@@ -567,6 +569,7 @@ def test_only_the_first_failure_in_a_row_is_notified(
 
 def test_a_failed_recovery_notification_is_logged(monkeypatch, capsys):
     monkeypatch.setattr(monitor, "_failures_in_a_row", 3)
+    monkeypatch.setattr(monitor, "_notified_kind", "network")
     monkeypatch.setattr(monitor, "_send_notification", lambda *args: False)
     monkeypatch.setattr(monitor, "run_cycle", lambda accounts, send_update=False: None)
     assert monitor.run_guarded_cycle([]) is True
@@ -613,3 +616,91 @@ def test_entry_numbers_agree_everywhere():
     urls = "json://a ,; json://b\njson://c"
     assert monitor._split_urls(urls) == ["json://a", "json://b", "json://c"]
     assert monitor._split_urls(" , ;\t") == []
+
+
+def test_a_new_kind_of_failure_is_notified_again(monkeypatch, capsys, notifications):
+    errors = [
+        monitor.YNABError("Network error fetching accounts: down", kind="network"),
+        monitor.YNABError("Network error fetching accounts: timed out", kind="network"),
+        monitor.YNABError(
+            "YNAB API error fetching accounts: HTTP 401", kind="HTTP 401"
+        ),
+        monitor.YNABError(
+            "YNAB API error fetching accounts: HTTP 401", kind="HTTP 401"
+        ),
+    ]
+    failing = iter(errors)
+
+    def run_cycle(accounts, send_update=False):
+        raise next(failing)
+
+    monkeypatch.setattr(monitor, "run_cycle", run_cycle)
+    for _ in errors:
+        monitor.run_guarded_cycle([])
+    bodies = [n["body"] for n in notifications]
+    assert len(bodies) == 2
+    assert "down" in bodies[0]
+    assert "HTTP 401" in bodies[1]
+
+
+def test_an_unsent_failure_notification_is_tried_again(monkeypatch):
+    results = [False, True]
+    sent = []
+
+    def send(urls_str, variable, title, message, notify_type):
+        sent.append(title)
+        return results.pop(0) if results else True
+
+    monkeypatch.setattr(monitor, "_send_notification", send)
+    failing_cycle(monkeypatch, monitor.YNABError("down", kind="network"))
+    monitor.run_guarded_cycle([])  # notification fails
+    monitor.run_guarded_cycle([])  # so this one is notified
+    monitor.run_guarded_cycle([])  # and this one isn't
+    assert sent == ["YNAB Balance Monitor failed"] * 2
+
+
+def test_no_recovery_notice_when_no_failure_was_notified(monkeypatch, notifications):
+    monkeypatch.setattr(monitor, "_failures_in_a_row", 2)  # never notified
+    monkeypatch.setattr(monitor, "run_cycle", lambda accounts, send_update=False: None)
+    assert monitor.run_guarded_cycle([]) is True
+    assert notifications == []
+    assert monitor._failures_in_a_row == 0
+
+
+def test_a_stop_means_no_further_requests(monkeypatch):
+    monkeypatch.setattr(monitor, "_stopping", lambda: True)
+    calls = flaky_urlopen(monkeypatch)
+    with pytest.raises(monitor._Stopped):
+        monitor.ynab_get("/b", "accounts")
+    assert calls == []
+
+
+def test_an_error_after_a_stop_is_a_stop_not_a_failure(monkeypatch, notifications):
+    # Retries used up; the stop cuts the request off: still no failure is reported.
+    stopping = []
+    monkeypatch.setattr(monitor, "_stopping", lambda: bool(stopping))
+
+    def fake_urlopen(request, timeout=None):
+        stopping.append(True)
+        raise URLError(OSError("reset by the stop"))
+
+    monkeypatch.setattr(monitor, "urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        monitor,
+        "run_cycle",
+        lambda accounts, send_update=False: monitor.ynab_get("/b", "accounts"),
+    )
+    with pytest.raises(monitor._Stopped):
+        monitor.run_guarded_cycle([])
+    assert notifications == []
+
+
+def test_a_comma_inside_a_url_stays_in_it(main_env):
+    url = "mailto://user:pass@example.com?to=a@example.com,b@example.com"
+    main_env.setenv("APPRISE_URLS", f"{url};json://localhost")
+    assert monitor._split_urls(
+        monitor.load_settings().apprise_urls.get_secret_value()
+    ) == [
+        url,
+        "json://localhost",
+    ]

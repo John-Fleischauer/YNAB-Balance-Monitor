@@ -96,9 +96,9 @@ on `main`, or every later deploy keeps running the pinned image.
 
 In scheduled mode, once the scheduler is running, `docker stop` (SIGTERM) ends its wait at
 once: the log says `Shutting down...` and the process exits 0. A check already running
-finishes first, unless it's waiting to retry a request, which a stop ends at once with no
-failure notification. Compose gives the stop 45 s (`stop_grace_period`), not Docker's default
-10 s, because one YNAB request can take up to 30 s. In run-once mode a stop ends the check where it is: the log says `Stopped
+makes no further YNAB request: it stops after the one in progress, or at once if it's waiting
+to retry, with no failure notification. Compose gives the stop 45 s (`stop_grace_period`), not
+Docker's default 10 s, because that one request can take up to 30 s. In run-once mode a stop ends the check where it is: the log says `Stopped
 before the check finished`, the process exits 143 and no failure notification goes out (a
 notification already being sent finishes or times out first: Apprise sends from a thread). A
 stop during startup takes Python's default action (exit 143, no log line); that's not a
@@ -108,20 +108,26 @@ fault.
 
 A network error, or HTTP 5xx or 429 from YNAB, is retried within the check: after 60 s, then
 after 300 s, each retry logged (`<reason>; retrying in 60 s`). The two waits are shared by the
-whole check, so a check never waits more than 6 minutes, inside the healthcheck's 10-minute
-heartbeat window. Any other 4xx (a revoked token is 401) or an unexpected reply fails at once.
+whole check, so it waits at most 6 minutes in all. The heartbeat isn't written during a check
+(only the scheduling loop writes it), so a check that also spends minutes on slow requests can
+outlast the healthcheck's 10-minute window and show `unhealthy` until it ends. Any other 4xx
+(a revoked token is 401) or an unexpected reply fails at once. A 429 is retried on the same
+waits; YNAB's limit is 200 requests an hour, so a 429 caused by other tools using up the hour
+may still fail after both.
 
 A failed check (retries used up, another YNAB error, or a bug) ends that check, not the
 container. The log gets one `Check failed: <reason>` line. In scheduled mode the loop then
 waits for the next run; run-once mode exits 1 instead.
 
-Only the first failure in a row is notified: the `APPRISE_URLS` services get a "YNAB Balance
-Monitor failed" notification with the reason. Later failures only log `Check still failing
-(<n> in a row); not notified again`. The first check that finishes after them sends one "YNAB
-Balance Monitor working again" notification. The count lives in memory: a restart starts
-again, so the first failure after a restart is notified even if the one before it was too. If
-a failure or recovery notification can't be sent, the log says `Could not send the failure
-notification` (or `recovery`) and the loop carries on.
+The first failure in a row is notified: the `APPRISE_URLS` services get a "YNAB Balance
+Monitor failed" notification with the reason. Later failures of the same kind only log `Check
+still failing (<n> in a row); not notified again`. A different kind (a network error, then
+HTTP 401) is notified again, and so is the next failure if the last notification couldn't be
+sent. The first check that finishes after a notified failure sends one "YNAB Balance Monitor
+working again" notification. This state lives in memory: a restart starts again, so the first
+failure after a restart is notified even if the one before it was too. If a failure or
+recovery notification can't be sent, the log says `Could not send the failure notification`
+(or `recovery`) and the loop carries on.
 
 Each YNAB request gives up after 30 s without a reply (`YNAB_TIMEOUT` in `monitor.py`), so a
 hung connection fails the check instead of blocking it. Apprise's services use Apprise's own
@@ -130,8 +136,9 @@ timeouts (4 s to connect and per read).
 No log line or notification of the app's own holds the YNAB token, an Apprise URL or any part
 of one, or an account or budget ID. An Apprise URL that doesn't load fails the boot, named
 by its variable and entry number only (`Error: APPRISE_URLS: entry 2 doesn't load in Apprise;
-check its format`); entries are counted after splitting on commas, semicolons and
-whitespace, as Apprise splits them, with blanks skipped. Apprise's logging is off while the
+check its format`). Entries are counted as Apprise's own parser splits the list (commas,
+semicolons or whitespace before the next `scheme://`, so a comma inside a URL stays in it),
+with blanks skipped. Apprise's logging is off while the
 URLs are checked, since it logs a URL it can't load. In the log lines of Apprise
 and other libraries, the token, each URL and each part of a URL 6 characters or longer are
 masked as `***`, tracebacks included; a shorter part (a 5-character password) isn't.
