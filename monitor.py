@@ -50,13 +50,26 @@ class _RedactSecrets(logging.Filter):
         # Longest first, so a whole URL is masked before the parts inside it.
         self._secrets = sorted(set(secrets), key=len, reverse=True)
 
-    def filter(self, record):
-        message = record.getMessage()
-        redacted = message
+    def _redact(self, text):
         for secret in self._secrets:
-            redacted = redacted.replace(secret, "***")
-        if redacted != message:
-            record.msg, record.args = redacted, None
+            text = text.replace(secret, "***")
+        return text
+
+    def filter(self, record):
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001 -- a bad log call must not raise from here
+            # logging's own error report would print the raw arguments; drop them.
+            message = f"{record.msg!s} (log arguments didn't match)"
+        record.msg, record.args = self._redact(message), None
+        # A traceback or stack is formatted after the filters run: mask it now, and
+        # cache it in exc_text, which the formatter uses instead of formatting again.
+        if record.exc_info and not record.exc_text:
+            record.exc_text = logging.Formatter().formatException(record.exc_info)
+        if record.exc_text:
+            record.exc_text = self._redact(record.exc_text)
+        if record.stack_info:
+            record.stack_info = self._redact(record.stack_info)
         return True
 
 
@@ -69,13 +82,13 @@ def _secret_parts(urls_str):
     masked too; Apprise may log a part percent-decoded, so both forms are listed.
     """
     parts = []
-    for url in urls_str.split(","):
-        url = url.strip()
+    # Apprise splits a URL list on whitespace and ';' as well as ','.
+    for url in re.split(r"[\s,;]+", urls_str):
         if not url:
             continue
         parts.append(url)
         _, _, rest = url.partition("://")
-        for piece in re.split(r"[/:@?&=,#]", rest):
+        for piece in re.split(r"[/:@?&=#]", rest):
             # Query keys get masked too; harmless, and simpler than parsing the query.
             for form in (piece, unquote(piece)):
                 if len(form) >= 6:
@@ -993,6 +1006,11 @@ def _run_once(accounts):
     except _Stopped as stop:
         print("Stopped before the check finished", file=sys.stderr)
         sys.exit(128 + stop.signum)
+    finally:
+        # Back to the defaults, so a signal from here on (a second one, or one just
+        # after the cycle) ends the process as usual instead of raising uncaught.
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGINT, signal.default_int_handler)
     sys.exit(0 if finished else 1)
 
 
@@ -1034,7 +1052,8 @@ def main():
     update_schedule = _parse_schedule(settings.update_schedule)
 
     if schedule is None and update_schedule is None:
-        _run_once(accounts)
+        _run_once(accounts)  # exits
+        return
 
     # Run on a schedule (at least one of check / update is recurring).
     # SIGTERM (docker stop) and SIGINT end the wait at once; a cycle already running

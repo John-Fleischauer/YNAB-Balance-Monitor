@@ -97,7 +97,8 @@ on `main`, or every later deploy keeps running the pinned image.
 In scheduled mode, once the scheduler is running, `docker stop` (SIGTERM) ends its wait at
 once: the log says `Shutting down...` and the process exits 0. A check already running
 finishes first. In run-once mode a stop ends the check where it is: the log says `Stopped
-before the check finished`, the process exits 143 and no failure notification goes out. A
+before the check finished`, the process exits 143 and no failure notification goes out (a
+notification already being sent finishes or times out first: Apprise sends from a thread). A
 stop during startup takes Python's default action (exit 143, no log line); that's not a
 fault.
 
@@ -114,7 +115,8 @@ Each YNAB request gives up after 30 s without a reply (`YNAB_TIMEOUT` in `monito
 hung connection fails the check instead of blocking it. Apprise's services use Apprise's own
 timeouts (4 s to connect and per read).
 
-No log line or notification holds the YNAB token, an Apprise URL or any part of one, or an
-account or budget ID: an Apprise URL that fails to load is named by its variable and entry
-number (`Apprise: APPRISE_URLS entry 2 failed to load`), and Apprise's own log lines have the
-URLs' parts masked as `***`.
+No log line or notification of the app's own holds the YNAB token, an Apprise URL or any part
+of one, or an account or budget ID: an Apprise URL that fails to load is named by its variable
+and entry number (`Apprise: APPRISE_URLS entry 2 failed to load`). In the log lines of Apprise
+and other libraries, the token, each URL and each part of a URL 6 characters or longer are
+masked as `***`, tracebacks included; a shorter part (a 5-character password) isn't.

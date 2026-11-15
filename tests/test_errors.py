@@ -72,10 +72,42 @@ def test_apprise_own_log_lines_are_redacted():
         logging.getLogger("apprise").error("token the-ynab-token")
     finally:
         root.removeHandler(handler)
+        monitor._install_redaction([])  # leave no secrets on the root handlers
     logged = stream.getvalue()
     assert "Unparseable" in logged  # Apprise did log, so the check means something
     assert "SECRET" not in logged
     assert "the-ynab-token" not in logged
+
+
+def test_secret_parts_split_like_apprise():
+    # Apprise accepts URLs separated by spaces or ';' as well as ','.
+    parts = monitor._secret_parts(
+        "discord://webhookid/TOKEN-ONE tgram://BOTTOKEN/x;json://hostname"
+    )
+    for secret in ("TOKEN-ONE", "BOTTOKEN", "hostname"):
+        assert secret in parts
+
+
+def test_redaction_survives_a_bad_log_call_and_masks_tracebacks():
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    root = logging.getLogger()
+    root.addHandler(handler)
+    log = logging.getLogger("apprise")
+    try:
+        monitor._install_redaction(["SECRET-TOKEN"])
+        log.error("bad %s %s", "SECRET-TOKEN")  # noqa: PLE1206 -- the bad call under test
+        try:
+            raise RuntimeError("https://hooks.example/SECRET-TOKEN")
+        except RuntimeError:
+            log.exception("send failed")
+    finally:
+        root.removeHandler(handler)
+        monitor._install_redaction([])
+    logged = stream.getvalue()
+    assert "log arguments didn't match" in logged
+    assert "RuntimeError" in logged
+    assert "SECRET-TOKEN" not in logged
 
 
 def test_secret_parts_cover_every_credential_position():
