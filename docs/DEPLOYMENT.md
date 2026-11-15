@@ -72,7 +72,8 @@ with a readable error, never printing a value. A blank value counts as unset.
 
 Accounts: set `YNAB_ACCOUNT_ID_CC` and/or `YNAB_ACCOUNT_ID_NO_CC`, **or** `YNAB_ACCOUNT_ID`;
 both forms together, neither, or a malformed entry fails the boot. The stack runs with a
-`SCHEDULE`: the healthcheck reads the heartbeat that only the scheduling loop writes.
+`SCHEDULE`: the healthcheck reads the heartbeat that only the scheduling loop and its retry
+waits write.
 
 The image sets `GIT_REVISION` and `PYTHONUNBUFFERED`; the stack doesn't.
 
@@ -107,13 +108,20 @@ fault.
 ## When a check fails
 
 A network error, or HTTP 5xx or 429 from YNAB, is retried within the check: after 60 s, then
-after 300 s, each retry logged (`<reason>; retrying in 60 s`). The two waits are shared by the
-whole check, so it waits at most 6 minutes in all. The heartbeat isn't written during a check
-(only the scheduling loop writes it), so a check that also spends minutes on slow requests can
-outlast the healthcheck's 10-minute window and show `unhealthy` until it ends. Any other 4xx
-(a revoked token is 401) or an unexpected reply fails at once. A 429 is retried on the same
-waits; YNAB's limit is 200 requests an hour, so a 429 caused by other tools using up the hour
-may still fail after both.
+after 300 s, each retry logged (`<reason>; retrying in 60 s`). The waits share one budget of
+6 minutes for the whole check. Any other 4xx (a revoked token is 401) or an unexpected reply
+fails at once.
+
+A 429 with a `Retry-After` header (seconds or an HTTP date) waits that long instead, logged as
+`retrying in <n> s (YNAB's Retry-After)`. If it asks for more than 300 s, or more than the
+check's budget has left, the check fails at once (`YNAB asked for a <n> s wait, more than this
+check can wait`) and is notified as usual: YNAB's limit is 200 requests an hour, so waiting
+longer belongs to the next run. A missing or unreadable header gets the normal waits. Only the
+parsed number of seconds is logged, never the header itself.
+
+In scheduled mode a retry wait writes the heartbeat at its start and every minute, so a long
+retry doesn't trip the healthcheck's 10-minute window. Requests themselves don't: a hung one
+still lets the heartbeat go stale, though each gives up after 30 s.
 
 A failed check (retries used up, another YNAB error, or a bug) ends that check, not the
 container. The log gets one `Check failed: <reason>` line. In scheduled mode the loop then

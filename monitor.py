@@ -4,6 +4,7 @@
 import calendar
 import json
 import logging
+import math
 import os
 import re
 import select
@@ -12,7 +13,8 @@ import sys
 import time
 import traceback
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from http.client import HTTPException
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -377,9 +379,11 @@ YNAB_TIMEOUT = 30
 
 # Waits, in seconds, before the first and second retry of a YNAB request that failed
 # on the network or with HTTP 5xx/429; then the cycle fails. One budget per cycle, not
-# per request, so a cycle never spends more than 6 minutes waiting: well inside the
-# healthcheck's 10-minute heartbeat window.
+# per request, so a cycle never spends more than 6 minutes (RETRY_BUDGET) waiting. A
+# 429's Retry-After replaces the wait, up to MAX_RETRY_WAIT and within the budget.
 RETRY_WAITS = (60, 300)
+RETRY_BUDGET = sum(RETRY_WAITS)
+MAX_RETRY_WAIT = 300
 
 
 class YNABError(Exception):
@@ -390,9 +394,11 @@ class YNABError(Exception):
     reply that isn't what YNAB sends, won't fix itself by waiting.
     """
 
-    def __init__(self, message, retryable=False, kind="reply"):
+    def __init__(self, message, retryable=False, kind="reply", retry_after=None):
         super().__init__(message)
         self.retryable = retryable
+        # Seconds a 429's Retry-After asked for; None without a usable header.
+        self.retry_after = retry_after
         # What went wrong, coarsely ("network", "HTTP 401"): a change of kind during
         # an outage is notified again (run_guarded_cycle).
         self.kind = kind
@@ -407,11 +413,31 @@ def _sleep(seconds):
 # scheduled loop points it at _Stop.wait, so docker stop ends a retry wait at once. In
 # run-once mode time.sleep is interrupted by _Stopped from the signal handler.
 _retry_wait = _sleep
-# What's left of this cycle's RETRY_WAITS; run_guarded_cycle refills it.
+# What's left of this cycle's RETRY_WAITS and of its RETRY_BUDGET in seconds;
+# run_guarded_cycle refills both.
 _retries_left = []
+_wait_budget = 0
 # True once a stop is requested (the scheduled loop points it at its _Stop): the
 # check then makes no further YNAB request, so a stop doesn't wait out the whole check.
 _stopping = bool
+
+
+def _retry_after_seconds(value, now=None):
+    """Seconds a Retry-After header asks for (delay-seconds or an HTTP date), rounded
+    up; None if it's missing or neither form. Only this number is ever logged."""
+    if value is None:
+        return None
+    value = value.strip()
+    if re.fullmatch(r"\d{1,10}", value):
+        return int(value)
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if when.tzinfo is None:  # "-0000": an HTTP date is GMT
+        when = when.replace(tzinfo=UTC)
+    seconds = (when - (now or datetime.now(UTC))).total_seconds()
+    return max(0, math.ceil(seconds))
 
 
 def _ynab_error_name(http_error):
@@ -431,6 +457,7 @@ def ynab_get(path, what):
     holds the budget and account IDs. A retryable error is retried while this cycle's
     RETRY_WAITS last; a stop requested during a wait raises _Stopped.
     """
+    global _wait_budget
     while True:
         if _stopping():
             raise _Stopped(signal.SIGTERM)
@@ -442,8 +469,22 @@ def ynab_get(path, what):
                 raise _Stopped(signal.SIGTERM) from None
             if not e.retryable or not _retries_left:
                 raise
-            delay = _retries_left.pop(0)
-            print(f"{e}; retrying in {delay} s", file=sys.stderr)
+            slot = _retries_left.pop(0)
+            if e.retry_after is not None:
+                if e.retry_after > min(MAX_RETRY_WAIT, _wait_budget):
+                    # Waiting can't help within this check: fail now, not later.
+                    raise YNABError(
+                        f"{e}; YNAB asked for a {e.retry_after} s wait, "
+                        "more than this check can wait",
+                        kind=e.kind,
+                    ) from None
+                delay, why = e.retry_after, " (YNAB's Retry-After)"
+            else:
+                delay, why = min(slot, _wait_budget), ""
+                if delay <= 0:
+                    raise
+            _wait_budget -= delay
+            print(f"{e}; retrying in {delay} s{why}", file=sys.stderr)
             if _retry_wait(delay):
                 raise _Stopped(signal.SIGTERM) from None
 
@@ -462,6 +503,11 @@ def _ynab_get_once(path, what):
             f"YNAB API error fetching {what}: HTTP {e.code}{detail}",
             retryable=e.code >= 500 or e.code == 429,
             kind=f"HTTP {e.code}",
+            retry_after=(
+                _retry_after_seconds((e.headers or {}).get("Retry-After"))
+                if e.code == 429
+                else None
+            ),
         ) from None
     except URLError as e:
         # e.reason is the socket error ("Name or service not known"), never the URL.
@@ -986,8 +1032,9 @@ def run_guarded_cycle(accounts, send_update=False, will_retry=True):
     notified failure sends a recovery notice. Returns True if the cycle finished.
     A stop (_Stopped, a BaseException) passes through and counts as neither.
     """
-    global _retries_left, _failures_in_a_row, _notified_kind
+    global _retries_left, _wait_budget, _failures_in_a_row, _notified_kind
     _retries_left = list(RETRY_WAITS)
+    _wait_budget = RETRY_BUDGET
     try:
         run_cycle(accounts, send_update=send_update)
     except Exception as e:  # noqa: BLE001 -- the one handler for a cycle's errors
@@ -1061,13 +1108,31 @@ def _parse_schedule(schedule):
 def touch_heartbeat():
     """Update the heartbeat file so the container HEALTHCHECK sees the scheduler as alive.
 
-    Called only from the scheduling loop, never from run_cycle: a hung network
-    call during a cycle should let the heartbeat go stale.
+    Called from the scheduling loop and from retry waits (_heartbeat_wait), never from
+    the rest of run_cycle: a retry wait is a planned pause, but a hung network call
+    should let the heartbeat go stale.
     """
     try:
         Path(HEARTBEAT_PATH).touch()
     except OSError as e:
         print(f"Heartbeat: could not write {HEARTBEAT_PATH}: {e}", file=sys.stderr)
+
+
+def _heartbeat_wait(stop):
+    """A retry wait for the scheduled loop: ends at once on a stop, like _Stop.wait,
+    and writes the heartbeat at its start and at least once a minute, so a 5-minute
+    retry wait (up to 6 minutes a check) doesn't pass the healthcheck's window."""
+
+    def wait(seconds):
+        end = time.monotonic() + seconds
+        touch_heartbeat()
+        while (left := end - time.monotonic()) > 0:
+            if stop.wait(min(left, 60)):
+                return True
+            touch_heartbeat()
+        return stop.requested
+
+    return wait
 
 
 def _next_occurrence(schedule, after=None):
@@ -1209,9 +1274,10 @@ def main():
     # SIGTERM (docker stop) and SIGINT end the wait at once; a cycle already running
     # finishes first.
     stop = _Stop()
-    # A retry wait ends at once on a stop, like the wait between runs.
+    # A retry wait ends at once on a stop, like the wait between runs, and keeps the
+    # heartbeat fresh.
     global _retry_wait, _stopping
-    _retry_wait = stop.wait
+    _retry_wait = _heartbeat_wait(stop)
     _stopping = lambda: stop.requested
 
     # Determine initial next-run times.

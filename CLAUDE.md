@@ -25,4 +25,4 @@ A lightweight Python tool that projects the minimum balance of one or more accou
 - `stack.env` in docker-compose.yml for Portainer compatibility
 - `SCHEDULE` env var supports `HH:MM` (daily) or `Nh` (interval) formats
 - Image is built and pushed to GHCR by `.github/workflows/ci.yml`; compose only pulls (`pull_policy: always`), no `build:` block
-- Scheduled mode writes `/tmp/heartbeat` from the sleep loop (never from `run_cycle`), read by the compose HEALTHCHECK (10 min window). Run-once mode exits and has no heartbeat
+- Scheduled mode writes `/tmp/heartbeat` from the sleep loop and from retry waits (never from the rest of `run_cycle`), read by the compose HEALTHCHECK (10 min window). A retry wait is a planned pause of up to 6 min a check, so it keeps the heartbeat fresh; a hung network call must still let it go stale. Run-once mode exits and has no heartbeat

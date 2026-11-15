@@ -41,6 +41,7 @@ def fresh_state(monkeypatch):
     monkeypatch.setattr(monitor, "_notified_kind", None)
     monkeypatch.setattr(monitor, "_stopping", bool)
     monkeypatch.setattr(monitor, "_retries_left", [])
+    monkeypatch.setattr(monitor, "_wait_budget", 0)
     monkeypatch.setattr(monitor, "_retry_wait", monitor._sleep)
 
 
@@ -418,6 +419,7 @@ def waits(monkeypatch):
     seen = []
     monkeypatch.setattr(monitor, "_retry_wait", lambda s: seen.append(s) or False)
     monkeypatch.setattr(monitor, "_retries_left", list(monitor.RETRY_WAITS))
+    monkeypatch.setattr(monitor, "_wait_budget", monitor.RETRY_BUDGET)
     return seen
 
 
@@ -704,3 +706,166 @@ def test_a_comma_inside_a_url_stays_in_it(main_env):
         url,
         "json://localhost",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Retry-After on a 429
+# ---------------------------------------------------------------------------
+
+
+def too_many_requests(retry_after=None):
+    headers = {} if retry_after is None else {"Retry-After": retry_after}
+    return HTTPError(
+        "https://api.ynab.com/v1/x", 429, "Too Many", headers, io.BytesIO()
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("120", 120),
+        (" 0 ", 0),
+        ("Sun, 15 Nov 2026 12:02:00 GMT", 120),
+        ("Sun, 15 Nov 2026 11:59:00 GMT", 0),  # in the past
+        (None, None),
+        ("", None),
+        ("soon", None),
+        ("-5", None),
+        ("1.5", None),
+    ],
+)
+def test_retry_after_parsing(value, expected):
+    now = monitor.datetime(2026, 11, 15, 12, 0, tzinfo=monitor.UTC)
+    assert monitor._retry_after_seconds(value, now=now) == expected
+
+
+def test_a_429_waits_for_retry_after(monkeypatch, capsys, waits):
+    calls = flaky_urlopen(monkeypatch, too_many_requests("42"))
+    assert monitor.ynab_get("/b", "accounts") == {"ok": 1}
+    assert waits == [42]
+    assert len(calls) == 2
+    assert "retrying in 42 s (YNAB's Retry-After)" in capsys.readouterr().err
+    assert monitor._wait_budget == monitor.RETRY_BUDGET - 42
+
+
+def test_a_429_without_a_usable_header_uses_the_normal_waits(monkeypatch, waits):
+    flaky_urlopen(monkeypatch, too_many_requests("soon"), too_many_requests())
+    monitor.ynab_get("/b", "accounts")
+    assert waits == [60, 300]
+
+
+@pytest.mark.parametrize("value", ["301", "Sun, 15 Nov 2099 12:00:00 GMT"])
+def test_a_retry_after_over_the_cap_fails_at_once(monkeypatch, capsys, waits, value):
+    calls = flaky_urlopen(monkeypatch, too_many_requests(value))
+    with pytest.raises(monitor.YNABError, match="more than this check can wait"):
+        monitor.ynab_get("/b", "accounts")
+    assert waits == []
+    assert len(calls) == 1
+    assert "2099" not in capsys.readouterr().err
+
+
+def test_a_retry_after_over_the_budget_left_fails_at_once(monkeypatch, waits):
+    # 200 s used on the first 429 leaves 160 s: a second asking 200 s gives up.
+    calls = flaky_urlopen(
+        monkeypatch, too_many_requests("200"), too_many_requests("200")
+    )
+    with pytest.raises(monitor.YNABError, match="a 200 s wait"):
+        monitor.ynab_get("/b", "accounts")
+    assert waits == [200]
+    assert len(calls) == 2
+
+
+def test_a_normal_wait_is_cut_to_the_budget_left(monkeypatch, waits):
+    flaky_urlopen(monkeypatch, too_many_requests("300"), URLError(OSError("down")))
+    monitor.ynab_get("/b", "accounts")
+    assert waits == [300, 60]
+    assert monitor._wait_budget == 0
+
+
+def test_a_retry_after_failure_is_notified_without_the_header(
+    monkeypatch, notifications, waits
+):
+    flaky_urlopen(monkeypatch, too_many_requests("Sun, 15 Nov 2099 12:00:00 GMT"))
+    monkeypatch.setattr(
+        monitor,
+        "run_cycle",
+        lambda accounts, send_update=False: monitor.ynab_get("/b", "accounts"),
+    )
+    assert monitor.run_guarded_cycle([]) is False
+    [sent] = notifications
+    assert "HTTP 429" in sent["body"]
+    assert "more than this check can wait" in sent["body"]
+    assert "2099" not in sent["body"]
+
+
+# ---------------------------------------------------------------------------
+# The heartbeat during retry waits (scheduled mode)
+# ---------------------------------------------------------------------------
+
+
+class ClockStop:
+    """A _Stop whose wait advances a fake clock instead of sleeping."""
+
+    def __init__(self, clock, stop_after=None):
+        self.clock = clock
+        self.requested = False
+        self.waits = []
+        self.stop_after = stop_after
+
+    def wait(self, seconds):
+        self.waits.append(seconds)
+        self.clock[0] += seconds
+        if self.stop_after is not None and len(self.waits) >= self.stop_after:
+            self.requested = True
+        return self.requested
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(monitor.time, "monotonic", lambda: now[0])
+    return now
+
+
+def test_a_retry_wait_writes_the_heartbeat_every_minute(monkeypatch, clock):
+    beats = []
+    monkeypatch.setattr(monitor, "touch_heartbeat", lambda: beats.append(clock[0]))
+    stop = ClockStop(clock)
+    assert monitor._heartbeat_wait(stop)(300) is False
+    assert stop.waits == [60, 60, 60, 60, 60]
+    # At the start, then after each minute.
+    assert beats == [1000, 1060, 1120, 1180, 1240, 1300]
+
+
+def test_a_stop_ends_a_heartbeat_retry_wait_at_once(monkeypatch, clock):
+    monkeypatch.setattr(monitor, "touch_heartbeat", lambda: None)
+    stop = ClockStop(clock, stop_after=2)
+    assert monitor._heartbeat_wait(stop)(300) is True
+    assert stop.waits == [60, 60]
+
+
+def test_the_scheduled_loop_uses_the_heartbeat_wait_for_retries(
+    main_env, notifications
+):
+    main_env.setenv("SCHEDULE", "1h")
+    beats = []
+    main_env.setattr(monitor, "touch_heartbeat", lambda: beats.append(True))
+
+    class FakeStop:
+        requested = False
+
+        def wait(self, seconds):
+            self.requested = True  # docker stop during the first retry wait
+            return True
+
+    main_env.setattr(monitor, "_Stop", FakeStop)
+    flaky_urlopen(main_env, URLError(OSError("down")))
+    main_env.setattr(
+        monitor,
+        "run_cycle",
+        lambda accounts, send_update=False: monitor.ynab_get("/b", "accounts"),
+    )
+    monitor.main()
+    # One at startup, one at the start of the retry wait.
+    assert len(beats) == 2
+    assert notifications == []
