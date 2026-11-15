@@ -1,6 +1,6 @@
 # uv from its official image, pinned. A named stage, so Dependabot's docker
 # ecosystem reads it as a FROM line and bumps it.
-FROM ghcr.io/astral-sh/uv:0.13.7 AS uv
+FROM ghcr.io/astral-sh/uv:0.13.8 AS uv
 
 FROM python:3.13-slim
 
