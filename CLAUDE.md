@@ -6,7 +6,7 @@ A lightweight Python tool that projects the minimum balance of one or more accou
 
 ## Architecture
 
-- **Single file**: `monitor.py` — all logic in one Python script (only external dependency: `apprise`)
+- **Single file**: `monitor.py` — all logic in one Python script (external dependencies: `apprise`, `pydantic-settings`)
 - **Docker**: `Dockerfile` + `docker-compose.yml` — runs as a long-lived service with built-in scheduling
 - **Config**: Environment variables via `stack.env` (Portainer) or `.env`
 
@@ -20,7 +20,7 @@ A lightweight Python tool that projects the minimum balance of one or more accou
 
 ## Development notes
 
-- Uses Python stdlib (`urllib`, `json`, `calendar`) plus `apprise` for notifications
+- Uses Python stdlib (`urllib`, `json`, `calendar`) plus `apprise` for notifications and `pydantic-settings` for the boot-time config check
 - `ENV PYTHONUNBUFFERED=1` in the Dockerfile for unbuffered output (required for Docker log visibility)
 - `stack.env` in docker-compose.yml for Portainer compatibility
 - `SCHEDULE` env var supports `HH:MM` (daily) or `Nh` (interval) formats

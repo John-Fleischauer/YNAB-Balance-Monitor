@@ -433,7 +433,7 @@ def test_blank_optional_variables_get_their_defaults(env):
     assert settings.monitor_days is None
     assert settings.update_apprise_urls is None
     assert (settings.schedule, settings.update_schedule) == ("", "")
-    assert settings.min_balance == 0
+    assert settings.accounts[0].min_balance == 0
 
 
 def test_missing_required_variables_are_named(env, capsys):
@@ -441,7 +441,7 @@ def test_missing_required_variables_are_named(env, capsys):
     env.setenv("APPRISE_URLS", " , ")
     assert refusals(capsys) == [
         "Error: YNAB_API_TOKEN is required",
-        "Error: APPRISE_URLS: must not be blank",
+        "Error: APPRISE_URLS: must hold at least one URL",
     ]
 
 
@@ -460,6 +460,30 @@ def test_every_malformed_value_is_reported_without_secrets(env, capsys):
         "UPDATE_SCHEDULE",
     ]
     assert "hunter2" not in "\n".join(lines)
+
+
+def test_min_balance_is_ignored_with_the_new_format(env):
+    # As before Phase 2: MIN_BALANCE belongs to YNAB_ACCOUNT_ID only.
+    env.setenv("MIN_BALANCE", "100.50")
+    [account] = monitor.load_settings().accounts
+    assert account.min_balance == 0
+
+
+def test_bad_min_balance_with_the_legacy_format_is_refused(env, capsys):
+    env.delenv("YNAB_ACCOUNT_ID_CC")
+    env.setenv("YNAB_ACCOUNT_ID", "a")
+    env.setenv("MIN_BALANCE", "100.50")
+    assert refusals(capsys) == ["Error: MIN_BALANCE must be a whole number of dollars"]
+
+
+def test_account_problems_are_reported_with_field_problems(env, capsys):
+    # pydantic skips the model validator when a field fails; load_settings doesn't.
+    env.setenv("MONITOR_DAYS", "ten")
+    env.setenv("YNAB_ACCOUNT_ID", "a")
+    lines = refusals(capsys)
+    assert len(lines) == 2
+    assert lines[0].startswith("Error: MONITOR_DAYS:")
+    assert lines[1].startswith("Error: Set YNAB_ACCOUNT_ID_CC/")
 
 
 def test_settings_reach_the_cycle(env):
@@ -498,7 +522,20 @@ def test_parse_schedule(value, expected):
 
 @pytest.mark.parametrize(
     "value",
-    ["daily", "xh", "8:00:00", "8", "0h", "-1h", "nanh", "infh", "24:00", "08:60"],
+    [
+        "daily",
+        "xh",
+        "8:00:00",
+        "8",
+        "0h",
+        "-1h",
+        "0.01h",  # cycles back to back
+        "100000000h",  # the next run's date overflows
+        "nanh",
+        "infh",
+        "24:00",
+        "08:60",
+    ],
 )
 def test_parse_schedule_refuses_bad_formats(value):
     with pytest.raises(ValueError, match="invalid schedule"):

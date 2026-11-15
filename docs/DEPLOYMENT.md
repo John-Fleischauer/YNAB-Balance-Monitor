@@ -61,11 +61,11 @@ with a readable error, never printing a value. A blank value counts as unset.
 | `YNAB_ACCOUNT_ID_CC` | one account form | | `id:threshold,id2:threshold`; CC payments counted. Threshold in whole dollars, default 0 |
 | `YNAB_ACCOUNT_ID_NO_CC` | one account form | | Same format; CC payments not counted |
 | `YNAB_ACCOUNT_ID` | one account form | | Older form: one account ID, CC payments counted |
-| `MIN_BALANCE` | no | `0` | Threshold for `YNAB_ACCOUNT_ID`, whole dollars |
+| `MIN_BALANCE` | no | `0` | Threshold for `YNAB_ACCOUNT_ID`, whole dollars; ignored with the newer form |
 | `YNAB_BUDGET_ID` | no | `last-used` | Budget to read |
 | `YNAB_CC_CATEGORIES` | no | all | Comma-separated credit card payment category IDs or names |
 | `MONITOR_DAYS` | no | end of month | Days to project ahead, 0 or more |
-| `SCHEDULE` | no | run once | `HH:MM` daily (24h) or `Nh` every N hours (N > 0) |
+| `SCHEDULE` | no | run once | `HH:MM` daily (24h) or `Nh` every N hours (0.1 to 8760) |
 | `UPDATE_SCHEDULE` | no | every check | Same format; when routine updates go out |
 | `TZ` | no | UTC | Time zone for daily schedules, e.g. `America/New_York` |
 | `APP_IMAGE` | no | `…:main` | Read by compose only: pins another image tag (rollback) |
@@ -94,5 +94,7 @@ on `main`, or every later deploy keeps running the pinned image.
 
 ## Stopping
 
-`docker stop` (SIGTERM) ends the scheduler's wait at once and the process exits 0. A check
-already running finishes first.
+In scheduled mode, once the scheduler is running, `docker stop` (SIGTERM) ends its wait at
+once: the log says `Shutting down...` and the process exits 0. A check already running
+finishes first. A stop during startup, or in run-once mode, takes Python's default action
+(exit 143, no log line); that's not a fault.

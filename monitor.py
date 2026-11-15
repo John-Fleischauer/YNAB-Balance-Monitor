@@ -4,11 +4,10 @@
 import calendar
 import json
 import logging
-import math
 import os
+import select
 import signal
 import sys
-import threading
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -59,7 +58,7 @@ class AccountConfig:
     name: str = ""  # populated at runtime from YNAB API
 
 
-def parse_account_configs(cc_raw, no_cc_raw, legacy_raw, min_balance):
+def parse_account_configs(cc_raw, no_cc_raw, legacy_raw, min_balance_raw):
     """Build the account list from the account variables; ValueError if they're unusable.
 
     New format:
@@ -69,6 +68,7 @@ def parse_account_configs(cc_raw, no_cc_raw, legacy_raw, min_balance):
 
     Legacy format (only when neither new variable is set):
       YNAB_ACCOUNT_ID=id  +  MIN_BALANCE=threshold     (CC payments included)
+      MIN_BALANCE is read only here, so a leftover value is ignored with the new format.
     """
     cc_raw, no_cc_raw, legacy_raw = (
         cc_raw.strip(),
@@ -87,6 +87,10 @@ def parse_account_configs(cc_raw, no_cc_raw, legacy_raw, min_balance):
                 "YNAB_ACCOUNT_ID takes one account ID, with its threshold in MIN_BALANCE; "
                 "for several accounts use YNAB_ACCOUNT_ID_CC or YNAB_ACCOUNT_ID_NO_CC"
             )
+        try:
+            min_balance = int(min_balance_raw.strip() or "0")
+        except ValueError:
+            raise ValueError("MIN_BALANCE must be a whole number of dollars") from None
         return [
             AccountConfig(
                 account_id=legacy_raw, min_balance=min_balance, include_cc=True
@@ -157,21 +161,31 @@ class Settings(BaseSettings):
     ynab_account_id_cc: str = ""
     ynab_account_id_no_cc: str = ""
     ynab_account_id: str = ""
-    min_balance: int = 0
+    # A string: parsed with YNAB_ACCOUNT_ID only, as parse_account_configs says.
+    min_balance: str = ""
 
     _accounts: list[AccountConfig] = PrivateAttr(default_factory=list)
 
-    @field_validator("ynab_api_token", "apprise_urls")
+    @field_validator("ynab_api_token")
     @classmethod
-    def _not_blank(cls, value):
+    def _token_not_blank(cls, value):
         stripped = value.get_secret_value().strip()
-        if not any(part.strip() for part in stripped.split(",")):
+        if not stripped:
             raise ValueError("must not be blank")
+        return SecretStr(stripped)
+
+    @field_validator("apprise_urls")
+    @classmethod
+    def _has_a_url(cls, value):
+        stripped = value.get_secret_value().strip()
+        if not stripped.strip(" ,"):
+            raise ValueError("must hold at least one URL")
         return SecretStr(stripped)
 
     @field_validator("update_apprise_urls")
     @classmethod
-    def _blank_is_unset(cls, value):
+    def _no_urls_is_unset(cls, value):
+        # Whitespace or bare commas: env_ignore_empty only catches "".
         if value is None or not value.get_secret_value().strip(" ,"):
             return None
         return SecretStr(value.get_secret_value().strip())
@@ -217,9 +231,30 @@ def load_settings():
         return Settings()
     except ValidationError as e:
         # include_input=False: the failing value may be a secret.
-        for error in e.errors(include_input=False, include_url=False):
-            print(f"Error: {_describe_error(error)}", file=sys.stderr)
-        sys.exit(1)
+        problems = [
+            _describe_error(error)
+            for error in e.errors(include_input=False, include_url=False)
+        ]
+    # pydantic skips the account check (a model validator) when any field failed;
+    # run it here too, so one boot reports every problem.
+    try:
+        parse_account_configs(
+            *(
+                os.environ.get(name, "")
+                for name in (
+                    "YNAB_ACCOUNT_ID_CC",
+                    "YNAB_ACCOUNT_ID_NO_CC",
+                    "YNAB_ACCOUNT_ID",
+                    "MIN_BALANCE",
+                )
+            )
+        )
+    except ValueError as account_problem:
+        if str(account_problem) not in problems:
+            problems.append(str(account_problem))
+    for problem in problems:
+        print(f"Error: {problem}", file=sys.stderr)
+    sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -654,26 +689,31 @@ def run_cycle(accounts, send_update=False):
 # ---------------------------------------------------------------------------
 
 
+MIN_INTERVAL_HOURS = 0.1
+MAX_INTERVAL_HOURS = 8760
+
+
 def _parse_schedule(schedule):
     """Parse a schedule string into a descriptor tuple; ValueError if it's malformed.
 
     Supported formats:
       "08:00"  - run daily at this time (24h format)
-      "6h"     - run every N hours (N > 0)
+      "6h"     - run every N hours (0.1 <= N <= 8760)
       ""       - run once and exit (returns None)
     """
     s = schedule.strip()
     if not s:
         return None
 
-    # Interval format: "6h", "12h", etc. A zero, negative or non-finite interval
-    # would run cycles back to back.
+    # Interval format: "6h", "12h", etc. Bounded: below 6 minutes, cycles run close to
+    # back to back against YNAB's 200 requests/hour; above a year, the next run's date
+    # overflows. NaN fails both comparisons.
     if s.endswith("h"):
         try:
             hours = float(s[:-1])
         except ValueError:
             hours = None
-        if hours is not None and math.isfinite(hours) and hours > 0:
+        if hours is not None and MIN_INTERVAL_HOURS <= hours <= MAX_INTERVAL_HOURS:
             return ("interval", hours * 3600)
 
     # Daily time format: "HH:MM"
@@ -685,7 +725,10 @@ def _parse_schedule(schedule):
         if hour is not None and 0 <= hour <= 23 and 0 <= minute <= 59:
             return ("daily", hour, minute)
 
-    raise ValueError(f"invalid schedule '{s}': use 'HH:MM' (24h) or 'Nh' (N > 0)")
+    raise ValueError(
+        f"invalid schedule '{s}': use 'HH:MM' (24h) or 'Nh' "
+        f"({MIN_INTERVAL_HOURS:g} <= N <= {MAX_INTERVAL_HOURS:g})"
+    )
 
 
 def touch_heartbeat():
@@ -721,6 +764,38 @@ def _describe_schedule(label, parsed):
     else:
         _, hour, minute = parsed
         print(f"{label}: daily at {hour:02d}:{minute:02d}")
+
+
+class _Stop:
+    """SIGTERM/SIGINT as a flag, and a wait that a signal ends at once.
+
+    The handler takes no lock (it runs in the main thread, which may hold any lock
+    when the signal lands): it only sets a flag. The C-level handler also writes a
+    byte to the wakeup pipe, which wakes a select() already waiting on it.
+    """
+
+    def __init__(self):
+        self.requested = False
+        self._read, write = os.pipe()
+        os.set_blocking(self._read, False)
+        os.set_blocking(write, False)
+        signal.set_wakeup_fd(write)
+        signal.signal(signal.SIGTERM, self._handle)
+        signal.signal(signal.SIGINT, self._handle)
+
+    def _handle(self, signum, frame):
+        self.requested = True
+
+    def wait(self, seconds):
+        """Sleep up to `seconds`; True as soon as a stop is requested."""
+        if not self.requested:
+            readable, _, _ = select.select([self._read], [], [], seconds)
+            if readable:
+                try:
+                    os.read(self._read, 512)  # drain; the flag is what counts
+                except BlockingIOError:
+                    pass
+        return self.requested
 
 
 def _apply(settings):
@@ -761,16 +836,7 @@ def main():
     # Run on a schedule (at least one of check / update is recurring).
     # SIGTERM (docker stop) and SIGINT end the wait at once; a cycle already running
     # finishes first.
-    stop = threading.Event()
-
-    def handle_signal(signum, frame):
-        # The handler runs in the main thread, which may hold the Event's internal
-        # lock inside stop.wait() when the signal lands; set() from the handler
-        # would then deadlock on it. Another thread can wait for that lock.
-        threading.Thread(target=stop.set).start()
-
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
+    stop = _Stop()
 
     # Determine initial next-run times.
     # Interval schedules fire immediately on startup; daily schedules wait for
@@ -795,7 +861,7 @@ def main():
 
     touch_heartbeat()
 
-    while not stop.is_set():
+    while not stop.requested:
         # Sleep until the sooner of the two pending events
         candidates = [t for t in [next_check, next_update] if t is not None]
         if not candidates:
@@ -810,7 +876,7 @@ def main():
                 touch_heartbeat()
                 wait = (wake_time - datetime.now()).total_seconds()
 
-        if stop.is_set():
+        if stop.requested:
             break
 
         now = datetime.now()

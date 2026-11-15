@@ -24,8 +24,9 @@ services:
       # assumes a schedule.
       SCHEDULE: ${SCHEDULE:-}
       UPDATE_SCHEDULE: ${UPDATE_SCHEDULE:-}
-      # Daily schedules are in this time zone; unset is UTC.
-      TZ: ${TZ:-}
+      # Daily schedules are in this time zone. An explicit UTC default, so TZ is
+      # never present-but-empty in the container.
+      TZ: ${TZ:-UTC}
     restart: unless-stopped
     # Heartbeat written by the scheduling loop (scheduled mode only).
     # In run-once mode the process exits after one run and this check does not apply.
