@@ -5,14 +5,18 @@ import calendar
 import json
 import logging
 import os
+import re
 import select
 import signal
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from http.client import HTTPException
 from pathlib import Path
 from urllib.error import HTTPError, URLError
+from urllib.parse import unquote
 from urllib.request import Request, urlopen
 
 import apprise
@@ -31,6 +35,62 @@ logging.basicConfig(
     stream=sys.stderr, level=logging.WARNING, format="%(name)s: %(message)s"
 )
 logging.getLogger("apprise").setLevel(logging.INFO)
+
+
+class _RedactSecrets(logging.Filter):
+    """Mask the token and every part of the Apprise URLs in any log record.
+
+    Apprise logs a URL it can't load ("Unparseable Telegram URL tgram://<bot token>/"),
+    and the URLs carry their credentials. Installed on the root handlers by _apply(), so
+    it sees Apprise's records (they propagate to root) as well as any other library's.
+    """
+
+    def __init__(self, secrets):
+        super().__init__()
+        # Longest first, so a whole URL is masked before the parts inside it.
+        self._secrets = sorted(set(secrets), key=len, reverse=True)
+
+    def filter(self, record):
+        message = record.getMessage()
+        redacted = message
+        for secret in self._secrets:
+            redacted = redacted.replace(secret, "***")
+        if redacted != message:
+            record.msg, record.args = redacted, None
+        return True
+
+
+def _secret_parts(urls_str):
+    """Each Apprise URL and the parts of it that may be a credential.
+
+    Apprise URLs put credentials anywhere after the scheme: user and password, the host
+    (a Telegram bot token), path segments (a Discord webhook token) or query values.
+    Parts under 6 characters are left alone, or common words in log lines would be
+    masked too; Apprise may log a part percent-decoded, so both forms are listed.
+    """
+    parts = []
+    for url in urls_str.split(","):
+        url = url.strip()
+        if not url:
+            continue
+        parts.append(url)
+        _, _, rest = url.partition("://")
+        for piece in re.split(r"[/:@?&=,#]", rest):
+            # Query keys get masked too; harmless, and simpler than parsing the query.
+            for form in (piece, unquote(piece)):
+                if len(form) >= 6:
+                    parts.append(form)
+    return parts
+
+
+def _install_redaction(secrets):
+    """Mask these values in every record the root logger's handlers write."""
+    redact = _RedactSecrets([s for s in secrets if s])
+    for handler in logging.getLogger().handlers:
+        for old in [f for f in handler.filters if isinstance(f, _RedactSecrets)]:
+            handler.removeFilter(old)
+        handler.addFilter(redact)
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -262,20 +322,58 @@ def load_settings():
 # ---------------------------------------------------------------------------
 
 
-def ynab_get(path):
-    """Make an authenticated GET request to the YNAB API."""
+# Seconds urlopen waits to connect, and then for each read, before giving up. YNAB
+# normally answers in well under a second; 30 s allows a slow response but ends a hung
+# connection, so the cycle fails and is reported instead of blocking until restarted.
+YNAB_TIMEOUT = 30
+
+
+class YNABError(Exception):
+    """A YNAB request failed. The message is safe to log and to send in a notification:
+    it never holds the token, the request URL (budget and account IDs) or the reply body."""
+
+
+def _ynab_error_name(http_error):
+    """The error name from YNAB's JSON error body ("unauthorized"), or "" if there's none."""
+    try:
+        name = json.loads(http_error.read().decode())["error"]["name"]
+    except (OSError, HTTPException, ValueError, KeyError, TypeError):
+        return ""
+    # A short identifier, by YNAB's API docs; anything else isn't printed.
+    return name if isinstance(name, str) and re.fullmatch(r"[a-z_]{1,40}", name) else ""
+
+
+def ynab_get(path, what):
+    """GET from the YNAB API and return the reply's `data`; YNABError if that fails.
+
+    `what` names the request in the error ("scheduled transactions"), since the path
+    holds the budget and account IDs.
+    """
     url = f"{YNAB_BASE}{path}"
     req = Request(url, headers={"Authorization": f"Bearer {YNAB_API_TOKEN}"})
     try:
-        with urlopen(req) as resp:
+        with urlopen(req, timeout=YNAB_TIMEOUT) as resp:
             return json.loads(resp.read().decode())["data"]
     except HTTPError as e:
-        body = e.read().decode()
-        print(f"YNAB API error ({e.code}): {body}", file=sys.stderr)
-        sys.exit(1)
+        name = _ynab_error_name(e)
+        detail = f" ({name})" if name else ""
+        raise YNABError(
+            f"YNAB API error fetching {what}: HTTP {e.code}{detail}"
+        ) from None
     except URLError as e:
-        print(f"Network error: {e.reason}", file=sys.stderr)
-        sys.exit(1)
+        # e.reason is the socket error ("Name or service not known"), never the URL.
+        raise YNABError(f"Network error fetching {what}: {e.reason}") from None
+    except TimeoutError:
+        # A read that times out raises this directly, not wrapped in URLError.
+        raise YNABError(
+            f"Network error fetching {what}: no reply within {YNAB_TIMEOUT} s"
+        ) from None
+    except (OSError, HTTPException) as e:
+        # A dropped connection or a short read: the type says enough.
+        raise YNABError(f"Network error fetching {what}: {type(e).__name__}") from None
+    except (ValueError, KeyError, TypeError):
+        # Not JSON, or JSON without `data`: say so without echoing the body.
+        raise YNABError(f"Unexpected reply from YNAB fetching {what}") from None
 
 
 def milliunits_to_dollars(milliunits):
@@ -303,7 +401,7 @@ def get_end_date():
 
 def get_account_balance(account_id):
     """Get the current balance and name of the given account."""
-    data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/accounts/{account_id}")
+    data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/accounts/{account_id}", "an account")
     account = data["account"]
     balance = milliunits_to_dollars(account["balance"])
     print(f"Account: {account['name']}")
@@ -385,7 +483,9 @@ def _expand_occurrences(next_date, frequency, start, end):
 
 def fetch_all_scheduled_transactions():
     """Fetch all scheduled transactions from the budget (single API call)."""
-    data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions")
+    data = ynab_get(
+        f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions", "scheduled transactions"
+    )
     return data["scheduled_transactions"]
 
 
@@ -441,7 +541,7 @@ def get_cc_payment_amounts(cc_categories_filter=""):
     Returns a dict of {account_id: {name, amount}} and the total amount.
     """
     # Get all accounts to identify credit card accounts and map category names
-    accounts_data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/accounts")
+    accounts_data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/accounts", "accounts")
     cc_accounts = {}
     for acct in accounts_data["accounts"]:
         if (
@@ -452,7 +552,7 @@ def get_cc_payment_amounts(cc_categories_filter=""):
             cc_accounts[acct["name"]] = acct["id"]
 
     # Get categories and find the Credit Card Payments group
-    categories_data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/categories")
+    categories_data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/categories", "categories")
 
     # Parse user-specified CC categories filter
     cc_filter = set()
@@ -551,22 +651,27 @@ def project_minimum_balance(
 # ---------------------------------------------------------------------------
 
 
-def _build_notifier(urls_str):
-    """Build an Apprise notifier from a comma-separated URL string."""
+def _build_notifier(urls_str, variable):
+    """Build an Apprise notifier from a comma-separated URL string.
+
+    A URL that fails to load is reported by `variable` and entry number only: the URL
+    carries its credentials, so no part of it is printed.
+    """
     notifier = apprise.Apprise()
-    for url in urls_str.split(","):
+    for number, url in enumerate(urls_str.split(","), start=1):
         url = url.strip()
         if url and not notifier.add(url):
-            print(f"Apprise: failed to load URL: {url[:40]}...", file=sys.stderr)
+            print(f"Apprise: {variable} entry {number} failed to load", file=sys.stderr)
     return notifier
 
 
-def _send_notification(urls_str, title, message, notify_type):
+def _send_notification(urls_str, variable, title, message, notify_type):
     """Send a notification via Apprise with retry logic.
 
+    `variable` names where urls_str came from, for the load-failure message.
     Returns True on success, False on failure.
     """
-    notifier = _build_notifier(urls_str)
+    notifier = _build_notifier(urls_str, variable)
     if len(notifier) == 0:
         print("Apprise: no valid notification URLs loaded", file=sys.stderr)
         return False
@@ -598,7 +703,7 @@ def send_alert_notification(min_balance, min_date, account_name, min_threshold):
         apprise.NotifyType.FAILURE if min_balance < 0 else apprise.NotifyType.WARNING
     )
 
-    if _send_notification(APPRISE_URLS, title, message, notify_type):
+    if _send_notification(APPRISE_URLS, "APPRISE_URLS", title, message, notify_type):
         print("\nAlert notification sent via Apprise")
 
 
@@ -614,15 +719,44 @@ def send_update_notification(
         f"Threshold: ${min_threshold:,.2f} — {status}."
     )
 
-    urls = UPDATE_APPRISE_URLS or APPRISE_URLS
+    if UPDATE_APPRISE_URLS:
+        urls, variable = UPDATE_APPRISE_URLS, "UPDATE_APPRISE_URLS"
+    else:
+        urls, variable = APPRISE_URLS, "APPRISE_URLS"
     notify_type = (
         apprise.NotifyType.WARNING
         if min_balance < min_threshold
         else apprise.NotifyType.SUCCESS
     )
 
-    if _send_notification(urls, title, message, notify_type):
+    if _send_notification(urls, variable, title, message, notify_type):
         print("\nUpdate notification sent via Apprise")
+
+
+def send_failure_notification(reason, will_retry):
+    """Tell the alert URLs that a cycle failed. Never raises: a failure here is logged.
+
+    `reason` must already be safe to send (no token, URLs or account IDs).
+    """
+    title = "YNAB Balance Monitor failed"
+    message = f"The balance check didn't finish: {reason}."
+    if will_retry:
+        message += " It runs again at the next scheduled time."
+    try:
+        sent = _send_notification(
+            APPRISE_URLS, "APPRISE_URLS", title, message, apprise.NotifyType.FAILURE
+        )
+    except Exception as e:  # noqa: BLE001 -- a failed notify must not end the loop
+        # Only the type: an exception from inside Apprise may quote a URL.
+        print(
+            f"Could not send the failure notification: {type(e).__name__}",
+            file=sys.stderr,
+        )
+        return
+    if sent:
+        print("Failure notification sent via Apprise")
+    else:
+        print("Could not send the failure notification", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -682,6 +816,36 @@ def run_cycle(accounts, send_update=False):
             send_update_notification(
                 min_balance, min_date, end_date, name, acct.min_balance
             )
+
+
+def _describe_failure(error):
+    """A one-line reason for a failed cycle that is safe to log and to send.
+
+    A YNABError's message is built to be safe. Any other exception's message could
+    quote data or a URL, so only its type and where it was raised are given.
+    """
+    if isinstance(error, YNABError):
+        return str(error)
+    frames = traceback.extract_tb(error.__traceback__)
+    where = f" in {frames[-1].name}, line {frames[-1].lineno}" if frames else ""
+    return f"unexpected {type(error).__name__}{where}"
+
+
+def run_guarded_cycle(accounts, send_update=False, will_retry=True):
+    """Run one cycle; if it fails, log why and send a failure notification.
+
+    The one place a cycle's errors are handled: a YNAB or network error, or a bug, ends
+    this cycle but never the scheduling loop. Returns True if the cycle finished.
+    A SIGTERM in run-once mode (_Stopped, a BaseException) passes through.
+    """
+    try:
+        run_cycle(accounts, send_update=send_update)
+    except Exception as e:  # noqa: BLE001 -- the one handler for a cycle's errors
+        reason = _describe_failure(e)
+        print(f"\nCheck failed: {reason}", file=sys.stderr)
+        send_failure_notification(reason, will_retry)
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -798,6 +962,40 @@ class _Stop:
         return self.requested
 
 
+class _Stopped(BaseException):
+    """SIGTERM/SIGINT in run-once mode: ends the cycle wherever it is.
+
+    A BaseException, so the cycle's error handler lets it through: a stop isn't a
+    failure to notify about.
+    """
+
+    def __init__(self, signum):
+        super().__init__(signum)
+        self.signum = signum
+
+
+def _raise_stopped(signum, frame):
+    # Python runs this in the main thread between bytecodes; a socket read in progress
+    # is interrupted (EINTR) and this exception propagates out of urlopen.
+    raise _Stopped(signum)
+
+
+def _run_once(accounts):
+    """Run one cycle and exit: 0 if it finished, 1 if it failed, 128+signal if stopped.
+
+    Unlike the scheduled loop, a stop here doesn't let the cycle finish: there's no
+    wait to end, and a cycle stuck on a slow request would outlast docker stop's 10 s.
+    """
+    signal.signal(signal.SIGTERM, _raise_stopped)
+    signal.signal(signal.SIGINT, _raise_stopped)
+    try:
+        finished = run_guarded_cycle(accounts, will_retry=False)
+    except _Stopped as stop:
+        print("Stopped before the check finished", file=sys.stderr)
+        sys.exit(128 + stop.signum)
+    sys.exit(0 if finished else 1)
+
+
 def _apply(settings):
     """Hand the validated settings to the module-level names the cycle reads."""
     global YNAB_API_TOKEN, YNAB_BUDGET_ID, YNAB_CC_CATEGORIES, MONITOR_DAYS
@@ -811,6 +1009,13 @@ def _apply(settings):
         settings.update_apprise_urls.get_secret_value()
         if settings.update_apprise_urls
         else ""
+    )
+    _install_redaction(
+        [
+            YNAB_API_TOKEN,
+            *_secret_parts(APPRISE_URLS),
+            *_secret_parts(UPDATE_APPRISE_URLS),
+        ]
     )
 
 
@@ -829,9 +1034,7 @@ def main():
     update_schedule = _parse_schedule(settings.update_schedule)
 
     if schedule is None and update_schedule is None:
-        # Run once and exit
-        run_cycle(accounts)
-        return
+        _run_once(accounts)
 
     # Run on a schedule (at least one of check / update is recurring).
     # SIGTERM (docker stop) and SIGINT end the wait at once; a cycle already running
@@ -886,7 +1089,8 @@ def main():
         # Run the projection (always checks alert threshold; optionally sends
         # an update notification when the update schedule fires, or on every
         # check when no separate UPDATE_SCHEDULE is configured).
-        run_cycle(
+        # A failed cycle is logged and notified; the loop waits for the next run.
+        run_guarded_cycle(
             accounts, send_update=do_update or (do_check and update_schedule is None)
         )
 

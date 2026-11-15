@@ -96,5 +96,25 @@ on `main`, or every later deploy keeps running the pinned image.
 
 In scheduled mode, once the scheduler is running, `docker stop` (SIGTERM) ends its wait at
 once: the log says `Shutting down...` and the process exits 0. A check already running
-finishes first. A stop during startup, or in run-once mode, takes Python's default action
-(exit 143, no log line); that's not a fault.
+finishes first. In run-once mode a stop ends the check where it is: the log says `Stopped
+before the check finished`, the process exits 143 and no failure notification goes out. A
+stop during startup takes Python's default action (exit 143, no log line); that's not a
+fault.
+
+## When a check fails
+
+A YNAB or network error, or a bug, ends that check, not the container. The log gets one
+`Check failed: <reason>` line and the `APPRISE_URLS` services get a "YNAB Balance Monitor
+failed" notification with the same reason; in scheduled mode the loop then waits for the next
+run. Run-once mode exits 1 instead. If the failure notification can't be sent, the log says
+`Could not send the failure notification` and the loop carries on. A failure in every check
+(YNAB down for a day on an hourly schedule) sends one notification per check.
+
+Each YNAB request gives up after 30 s without a reply (`YNAB_TIMEOUT` in `monitor.py`), so a
+hung connection fails the check instead of blocking it. Apprise's services use Apprise's own
+timeouts (4 s to connect and per read).
+
+No log line or notification holds the YNAB token, an Apprise URL or any part of one, or an
+account or budget ID: an Apprise URL that fails to load is named by its variable and entry
+number (`Apprise: APPRISE_URLS entry 2 failed to load`), and Apprise's own log lines have the
+URLs' parts masked as `***`.
