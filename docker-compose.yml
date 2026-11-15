@@ -4,7 +4,29 @@ services:
     # Compose only pulls; there is deliberately no build: block.
     image: ${APP_IMAGE:-ghcr.io/john-fleischauer/ynab-balance-monitor:main}
     pull_policy: always
-    env_file: .env
+    # Values come from the stack's environment, interpolated here (docs/DEPLOYMENT.md).
+    # A missing required one stops `compose up` with its message. Optional ones are
+    # passed as "" when unset, which the app treats as unset.
+    environment:
+      YNAB_API_TOKEN: ${YNAB_API_TOKEN:?set YNAB_API_TOKEN}
+      APPRISE_URLS: ${APPRISE_URLS:?set APPRISE_URLS}
+      UPDATE_APPRISE_URLS: ${UPDATE_APPRISE_URLS:-}
+      # Accounts: YNAB_ACCOUNT_ID_CC and/or YNAB_ACCOUNT_ID_NO_CC, or the older
+      # YNAB_ACCOUNT_ID with MIN_BALANCE. The app checks the combination at boot.
+      YNAB_ACCOUNT_ID_CC: ${YNAB_ACCOUNT_ID_CC:-}
+      YNAB_ACCOUNT_ID_NO_CC: ${YNAB_ACCOUNT_ID_NO_CC:-}
+      YNAB_ACCOUNT_ID: ${YNAB_ACCOUNT_ID:-}
+      MIN_BALANCE: ${MIN_BALANCE:-}
+      YNAB_BUDGET_ID: ${YNAB_BUDGET_ID:-}
+      YNAB_CC_CATEGORIES: ${YNAB_CC_CATEGORIES:-}
+      MONITOR_DAYS: ${MONITOR_DAYS:-}
+      # With both empty the app runs one check and exits; the healthcheck below
+      # assumes a schedule.
+      SCHEDULE: ${SCHEDULE:-}
+      UPDATE_SCHEDULE: ${UPDATE_SCHEDULE:-}
+      # Daily schedules are in this time zone. An explicit UTC default, so TZ is
+      # never present-but-empty in the container.
+      TZ: ${TZ:-UTC}
     restart: unless-stopped
     # Heartbeat written by the scheduling loop (scheduled mode only).
     # In run-once mode the process exits after one run and this check does not apply.

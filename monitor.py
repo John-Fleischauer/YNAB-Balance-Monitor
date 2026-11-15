@@ -5,6 +5,7 @@ import calendar
 import json
 import logging
 import os
+import select
 import signal
 import sys
 import time
@@ -15,6 +16,15 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import apprise
+from pydantic import (
+    Field,
+    PrivateAttr,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Surface Apprise's internal errors (network failures, auth errors, etc.)
 logging.basicConfig(
@@ -26,23 +36,13 @@ logging.getLogger("apprise").setLevel(logging.INFO)
 # Configuration
 # ---------------------------------------------------------------------------
 
-YNAB_API_TOKEN = os.environ.get("YNAB_API_TOKEN", "")
-YNAB_BUDGET_ID = os.environ.get("YNAB_BUDGET_ID", "last-used")
-YNAB_CC_CATEGORIES = os.environ.get(
-    "YNAB_CC_CATEGORIES", ""
-)  # comma-separated IDs, empty = all
-MONITOR_DAYS = os.environ.get("MONITOR_DAYS", "")  # empty = end of current month
-APPRISE_URLS = os.environ.get("APPRISE_URLS", "")  # comma-separated Apprise URLs
-SCHEDULE = os.environ.get(
-    "SCHEDULE", ""
-)  # e.g. "08:00" for daily at 8am, "6h" for every 6 hours
-UPDATE_SCHEDULE = os.environ.get(
-    "UPDATE_SCHEDULE", ""
-)  # when to send routine balance update notifications
-UPDATE_APPRISE_URLS = os.environ.get(
-    "UPDATE_APPRISE_URLS", ""
-)  # defaults to APPRISE_URLS if empty
-TZ = os.environ.get("TZ", "")
+# Set by main() from Settings once the environment has been validated.
+YNAB_API_TOKEN = ""
+YNAB_BUDGET_ID = "last-used"
+YNAB_CC_CATEGORIES = ""  # comma-separated IDs or names, empty = all
+MONITOR_DAYS = None  # None = end of current month
+APPRISE_URLS = ""  # comma-separated Apprise URLs
+UPDATE_APPRISE_URLS = ""  # empty = APPRISE_URLS
 
 YNAB_BASE = "https://api.ynab.com/v1"
 
@@ -58,69 +58,203 @@ class AccountConfig:
     name: str = ""  # populated at runtime from YNAB API
 
 
-def parse_account_configs():
-    """Parse account configuration from environment variables.
+def parse_account_configs(cc_raw, no_cc_raw, legacy_raw, min_balance_raw):
+    """Build the account list from the account variables; ValueError if they're unusable.
 
-    New format (checked first):
+    New format:
       YNAB_ACCOUNT_ID_CC=id:threshold,id2:threshold   (CC payments included)
       YNAB_ACCOUNT_ID_NO_CC=id:threshold,id2           (CC payments excluded)
       Threshold defaults to 0 if omitted.
 
-    Legacy format (fallback when new vars are not set):
+    Legacy format (only when neither new variable is set):
       YNAB_ACCOUNT_ID=id  +  MIN_BALANCE=threshold     (CC payments included)
+      MIN_BALANCE is read only here, so a leftover value is ignored with the new format.
     """
-    cc_raw = os.environ.get("YNAB_ACCOUNT_ID_CC", "").strip()
-    no_cc_raw = os.environ.get("YNAB_ACCOUNT_ID_NO_CC", "").strip()
-    legacy_raw = os.environ.get("YNAB_ACCOUNT_ID", "").strip()
+    cc_raw, no_cc_raw, legacy_raw = (
+        cc_raw.strip(),
+        no_cc_raw.strip(),
+        legacy_raw.strip(),
+    )
 
-    new_set = bool(cc_raw or no_cc_raw)
-    old_set = bool(legacy_raw)
-
-    if old_set and new_set:
-        print(
-            "Error: Cannot use YNAB_ACCOUNT_ID alongside YNAB_ACCOUNT_ID_CC/YNAB_ACCOUNT_ID_NO_CC",
-            file=sys.stderr,
+    if legacy_raw and (cc_raw or no_cc_raw):
+        raise ValueError(
+            "Set YNAB_ACCOUNT_ID_CC/YNAB_ACCOUNT_ID_NO_CC or the older YNAB_ACCOUNT_ID, not both"
         )
-        sys.exit(1)
 
-    if new_set:
-        accounts = []
-        for entry in _parse_account_entries(cc_raw):
-            accounts.append(
-                AccountConfig(
-                    account_id=entry[0], min_balance=entry[1], include_cc=True
-                )
+    if legacy_raw:
+        if "," in legacy_raw or ":" in legacy_raw:
+            raise ValueError(
+                "YNAB_ACCOUNT_ID takes one account ID, with its threshold in MIN_BALANCE; "
+                "for several accounts use YNAB_ACCOUNT_ID_CC or YNAB_ACCOUNT_ID_NO_CC"
             )
-        for entry in _parse_account_entries(no_cc_raw):
-            accounts.append(
-                AccountConfig(
-                    account_id=entry[0], min_balance=entry[1], include_cc=False
-                )
-            )
-        return accounts
-
-    if old_set:
-        min_bal = int(os.environ.get("MIN_BALANCE", "0"))
+        try:
+            min_balance = int(min_balance_raw.strip() or "0")
+        except ValueError:
+            raise ValueError("MIN_BALANCE must be a whole number of dollars") from None
         return [
-            AccountConfig(account_id=legacy_raw, min_balance=min_bal, include_cc=True)
+            AccountConfig(
+                account_id=legacy_raw, min_balance=min_balance, include_cc=True
+            )
         ]
 
-    return []
+    accounts = [
+        AccountConfig(account_id=acct_id, min_balance=threshold, include_cc=True)
+        for acct_id, threshold in _parse_account_entries(cc_raw, "YNAB_ACCOUNT_ID_CC")
+    ] + [
+        AccountConfig(account_id=acct_id, min_balance=threshold, include_cc=False)
+        for acct_id, threshold in _parse_account_entries(
+            no_cc_raw, "YNAB_ACCOUNT_ID_NO_CC"
+        )
+    ]
+    if not accounts:
+        raise ValueError(
+            "No accounts configured. Set YNAB_ACCOUNT_ID_CC, YNAB_ACCOUNT_ID_NO_CC, or YNAB_ACCOUNT_ID"
+        )
+    return accounts
 
 
-def _parse_account_entries(raw):
-    """Parse 'id:threshold,id2:threshold,...' into list of (account_id, min_balance) tuples."""
+def _parse_account_entries(raw, variable):
+    """Parse 'id:threshold,id2:threshold,...' into list of (account_id, min_balance) tuples.
+
+    A malformed entry raises ValueError naming the variable and the entry's position.
+    """
     entries = []
-    for part in raw.split(","):
+    for number, part in enumerate(raw.split(","), start=1):
         part = part.strip()
         if not part:
             continue
-        if ":" in part:
-            acct_id, threshold = part.split(":", 1)
-            entries.append((acct_id.strip(), int(threshold.strip())))
-        else:
-            entries.append((part, 0))
+        acct_id, has_threshold, threshold = part.partition(":")
+        acct_id = acct_id.strip()
+        if not acct_id:
+            raise ValueError(f"{variable} entry {number} has no account ID")
+        if not has_threshold:
+            entries.append((acct_id, 0))
+            continue
+        try:
+            entries.append((acct_id, int(threshold.strip())))
+        except ValueError:
+            raise ValueError(
+                f"{variable} entry {number}: the threshold after ':' must be a whole number of dollars"
+            ) from None
     return entries
+
+
+class Settings(BaseSettings):
+    """The environment, validated at boot. Each field is read from its upper-case name."""
+
+    # A blank variable counts as unset: compose passes every optional one as ${VAR:-},
+    # so an unset value arrives as "" and must still get its default.
+    model_config = SettingsConfigDict(env_ignore_empty=True)
+
+    # SecretStr keeps the values out of reprs and validation errors.
+    ynab_api_token: SecretStr
+    apprise_urls: SecretStr
+    update_apprise_urls: SecretStr | None = None
+
+    ynab_budget_id: str = "last-used"
+    ynab_cc_categories: str = ""
+    # None (unset) projects through the end of the current month.
+    monitor_days: int | None = Field(default=None, ge=0)
+    schedule: str = ""
+    update_schedule: str = ""
+
+    ynab_account_id_cc: str = ""
+    ynab_account_id_no_cc: str = ""
+    ynab_account_id: str = ""
+    # A string: parsed with YNAB_ACCOUNT_ID only, as parse_account_configs says.
+    min_balance: str = ""
+
+    _accounts: list[AccountConfig] = PrivateAttr(default_factory=list)
+
+    @field_validator("ynab_api_token")
+    @classmethod
+    def _token_not_blank(cls, value):
+        stripped = value.get_secret_value().strip()
+        if not stripped:
+            raise ValueError("must not be blank")
+        return SecretStr(stripped)
+
+    @field_validator("apprise_urls")
+    @classmethod
+    def _has_a_url(cls, value):
+        stripped = value.get_secret_value().strip()
+        if not stripped.strip(" ,"):
+            raise ValueError("must hold at least one URL")
+        return SecretStr(stripped)
+
+    @field_validator("update_apprise_urls")
+    @classmethod
+    def _no_urls_is_unset(cls, value):
+        # Whitespace or bare commas: env_ignore_empty only catches "".
+        if value is None or not value.get_secret_value().strip(" ,"):
+            return None
+        return SecretStr(value.get_secret_value().strip())
+
+    @field_validator("ynab_budget_id")
+    @classmethod
+    def _strip(cls, value):
+        return value.strip() or "last-used"
+
+    @field_validator("schedule", "update_schedule")
+    @classmethod
+    def _valid_schedule(cls, value):
+        _parse_schedule(value)
+        return value.strip()
+
+    @model_validator(mode="after")
+    def _build_accounts(self):
+        self._accounts = parse_account_configs(
+            self.ynab_account_id_cc,
+            self.ynab_account_id_no_cc,
+            self.ynab_account_id,
+            self.min_balance,
+        )
+        return self
+
+    @property
+    def accounts(self):
+        return self._accounts
+
+
+def _describe_error(error):
+    """One readable line for a settings error. Never includes the value that failed."""
+    name = str(error["loc"][0]).upper() if error["loc"] else ""
+    if error["type"] == "missing":
+        return f"{name} is required"
+    message = error["msg"].removeprefix("Value error, ")
+    return f"{name}: {message}" if name else message
+
+
+def load_settings():
+    """Read and validate the environment; print every problem and exit 1 if it's unusable."""
+    try:
+        return Settings()
+    except ValidationError as e:
+        # include_input=False: the failing value may be a secret.
+        problems = [
+            _describe_error(error)
+            for error in e.errors(include_input=False, include_url=False)
+        ]
+    # pydantic skips the account check (a model validator) when any field failed;
+    # run it here too, so one boot reports every problem.
+    try:
+        parse_account_configs(
+            *(
+                os.environ.get(name, "")
+                for name in (
+                    "YNAB_ACCOUNT_ID_CC",
+                    "YNAB_ACCOUNT_ID_NO_CC",
+                    "YNAB_ACCOUNT_ID",
+                    "MIN_BALANCE",
+                )
+            )
+        )
+    except ValueError as account_problem:
+        if str(account_problem) not in problems:
+            problems.append(str(account_problem))
+    for problem in problems:
+        print(f"Error: {problem}", file=sys.stderr)
+    sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -161,8 +295,8 @@ def get_end_date():
     Otherwise, project through the end of the current month.
     """
     today = datetime.now().date()
-    if MONITOR_DAYS:
-        return today + timedelta(days=int(MONITOR_DAYS))
+    if MONITOR_DAYS is not None:
+        return today + timedelta(days=MONITOR_DAYS)
     last_day = calendar.monthrange(today.year, today.month)[1]
     return date(today.year, today.month, last_day)
 
@@ -496,23 +630,6 @@ def send_update_notification(
 # ---------------------------------------------------------------------------
 
 
-def validate_config(accounts):
-    """Check required configuration is present."""
-    errors = []
-    if not YNAB_API_TOKEN:
-        errors.append("YNAB_API_TOKEN is required")
-    if not accounts:
-        errors.append(
-            "No accounts configured. Set YNAB_ACCOUNT_ID_CC, YNAB_ACCOUNT_ID_NO_CC, or YNAB_ACCOUNT_ID"
-        )
-    if not APPRISE_URLS:
-        errors.append("APPRISE_URLS is required")
-    if errors:
-        for e in errors:
-            print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-
 def run_cycle(accounts, send_update=False):
     """Run one balance check cycle for all accounts.
 
@@ -572,36 +689,46 @@ def run_cycle(accounts, send_update=False):
 # ---------------------------------------------------------------------------
 
 
+MIN_INTERVAL_HOURS = 0.1
+MAX_INTERVAL_HOURS = 8760
+
+
 def _parse_schedule(schedule):
-    """Parse a schedule string into a descriptor tuple.
+    """Parse a schedule string into a descriptor tuple; ValueError if it's malformed.
 
     Supported formats:
       "08:00"  - run daily at this time (24h format)
-      "6h"     - run every N hours
+      "6h"     - run every N hours (0.1 <= N <= 8760)
       ""       - run once and exit (returns None)
     """
     s = schedule.strip()
     if not s:
         return None
 
-    # Interval format: "6h", "12h", etc.
+    # Interval format: "6h", "12h", etc. Bounded: below 6 minutes, cycles run close to
+    # back to back against YNAB's 200 requests/hour; above a year, the next run's date
+    # overflows. NaN fails both comparisons.
     if s.endswith("h"):
         try:
             hours = float(s[:-1])
-            return ("interval", hours * 3600)
         except ValueError:
-            pass
+            hours = None
+        if hours is not None and MIN_INTERVAL_HOURS <= hours <= MAX_INTERVAL_HOURS:
+            return ("interval", hours * 3600)
 
     # Daily time format: "HH:MM"
     if ":" in s:
         try:
-            hour, minute = s.split(":")
-            return ("daily", int(hour), int(minute))
+            hour, minute = (int(part) for part in s.split(":"))
         except ValueError:
-            pass
+            hour = minute = None
+        if hour is not None and 0 <= hour <= 23 and 0 <= minute <= 59:
+            return ("daily", hour, minute)
 
-    print(f"Invalid schedule format: '{s}'. Use 'HH:MM' or 'Nh'.", file=sys.stderr)
-    sys.exit(1)
+    raise ValueError(
+        f"invalid schedule '{s}': use 'HH:MM' (24h) or 'Nh' "
+        f"({MIN_INTERVAL_HOURS:g} <= N <= {MAX_INTERVAL_HOURS:g})"
+    )
 
 
 def touch_heartbeat():
@@ -639,28 +766,77 @@ def _describe_schedule(label, parsed):
         print(f"{label}: daily at {hour:02d}:{minute:02d}")
 
 
-def main():
-    accounts = parse_account_configs()
-    validate_config(accounts)
+class _Stop:
+    """SIGTERM/SIGINT as a flag, and a wait that a signal ends at once.
 
-    schedule = _parse_schedule(SCHEDULE)
-    update_schedule = _parse_schedule(UPDATE_SCHEDULE) if UPDATE_SCHEDULE else None
+    The handler takes no lock (it runs in the main thread, which may hold any lock
+    when the signal lands): it only sets a flag. The C-level handler also writes a
+    byte to the wakeup pipe, which wakes a select() already waiting on it.
+    """
+
+    def __init__(self):
+        self.requested = False
+        self._read, write = os.pipe()
+        os.set_blocking(self._read, False)
+        os.set_blocking(write, False)
+        signal.set_wakeup_fd(write)
+        signal.signal(signal.SIGTERM, self._handle)
+        signal.signal(signal.SIGINT, self._handle)
+
+    def _handle(self, signum, frame):
+        self.requested = True
+
+    def wait(self, seconds):
+        """Sleep up to `seconds`; True as soon as a stop is requested."""
+        if not self.requested:
+            readable, _, _ = select.select([self._read], [], [], seconds)
+            if readable:
+                try:
+                    os.read(self._read, 512)  # drain; the flag is what counts
+                except BlockingIOError:
+                    pass
+        return self.requested
+
+
+def _apply(settings):
+    """Hand the validated settings to the module-level names the cycle reads."""
+    global YNAB_API_TOKEN, YNAB_BUDGET_ID, YNAB_CC_CATEGORIES, MONITOR_DAYS
+    global APPRISE_URLS, UPDATE_APPRISE_URLS
+    YNAB_API_TOKEN = settings.ynab_api_token.get_secret_value()
+    YNAB_BUDGET_ID = settings.ynab_budget_id
+    YNAB_CC_CATEGORIES = settings.ynab_cc_categories
+    MONITOR_DAYS = settings.monitor_days
+    APPRISE_URLS = settings.apprise_urls.get_secret_value()
+    UPDATE_APPRISE_URLS = (
+        settings.update_apprise_urls.get_secret_value()
+        if settings.update_apprise_urls
+        else ""
+    )
+
+
+def main():
+    # First, so `docker logs` shows what's running even when the config is refused.
+    # GIT_REVISION is the image's build arg (the commit it was built from).
+    print(
+        f"YNAB Balance Monitor starting, revision {os.environ.get('GIT_REVISION') or 'unknown'}"
+    )
+
+    settings = load_settings()
+    _apply(settings)
+    accounts = settings.accounts
+
+    schedule = _parse_schedule(settings.schedule)
+    update_schedule = _parse_schedule(settings.update_schedule)
 
     if schedule is None and update_schedule is None:
         # Run once and exit
         run_cycle(accounts)
         return
 
-    # Run on a schedule (at least one of check / update is recurring)
-    shutdown = False
-
-    def handle_signal(signum, frame):
-        nonlocal shutdown
-        print("\nShutting down...")
-        shutdown = True
-
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
+    # Run on a schedule (at least one of check / update is recurring).
+    # SIGTERM (docker stop) and SIGINT end the wait at once; a cycle already running
+    # finishes first.
+    stop = _Stop()
 
     # Determine initial next-run times.
     # Interval schedules fire immediately on startup; daily schedules wait for
@@ -685,7 +861,7 @@ def main():
 
     touch_heartbeat()
 
-    while not shutdown:
+    while not stop.requested:
         # Sleep until the sooner of the two pending events
         candidates = [t for t in [next_check, next_update] if t is not None]
         if not candidates:
@@ -695,12 +871,12 @@ def main():
         wait = (wake_time - datetime.now()).total_seconds()
         if wait > 0:
             print(f"Next event in {wait / 3600:.4g} hours")
-            while wait > 0 and not shutdown:
-                time.sleep(min(wait, 60))
-                wait -= 60
+            # Wake at least once a minute to refresh the heartbeat.
+            while wait > 0 and not stop.wait(min(wait, 60)):
                 touch_heartbeat()
+                wait = (wake_time - datetime.now()).total_seconds()
 
-        if shutdown:
+        if stop.requested:
             break
 
         now = datetime.now()
@@ -718,6 +894,8 @@ def main():
             next_check = _next_occurrence(schedule)
         if do_update and update_schedule:
             next_update = _next_occurrence(update_schedule)
+
+    print("Shutting down...")
 
 
 if __name__ == "__main__":

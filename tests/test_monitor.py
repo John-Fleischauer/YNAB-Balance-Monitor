@@ -246,7 +246,7 @@ def cycle(monkeypatch, today):
     sent = {"alerts": [], "updates": []}
 
     def run(balance, threshold, scheduled=(), include_cc=False, send_update=False):
-        monkeypatch.setattr(monitor, "MONITOR_DAYS", "10")
+        monkeypatch.setattr(monitor, "MONITOR_DAYS", 10)
         monkeypatch.setattr(
             monitor, "fetch_all_scheduled_transactions", lambda: list(scheduled)
         )
@@ -324,29 +324,66 @@ def test_update_sent_only_when_asked(cycle):
 
 
 def test_parse_account_entries():
-    assert monitor._parse_account_entries(" a:500, b ,,c:-20") == [
+    assert monitor._parse_account_entries(" a:500, b ,,c:-20", "VAR") == [
         ("a", 500),
         ("b", 0),
         ("c", -20),
     ]
 
 
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        ("a:500,b:lots", "VAR entry 2: the threshold"),
+        ("a:", "VAR entry 1: the threshold"),
+        ("a,:5", "VAR entry 2 has no account ID"),
+    ],
+)
+def test_parse_account_entries_refuses_malformed_entries(raw, message):
+    with pytest.raises(ValueError, match=message):
+        monitor._parse_account_entries(raw, "VAR")
+
+
+# Every variable Settings reads, cleared so the developer's own environment can't leak in.
+SETTINGS_VARIABLES = (
+    "YNAB_API_TOKEN",
+    "APPRISE_URLS",
+    "UPDATE_APPRISE_URLS",
+    "YNAB_BUDGET_ID",
+    "YNAB_CC_CATEGORIES",
+    "MONITOR_DAYS",
+    "SCHEDULE",
+    "UPDATE_SCHEDULE",
+    "YNAB_ACCOUNT_ID_CC",
+    "YNAB_ACCOUNT_ID_NO_CC",
+    "YNAB_ACCOUNT_ID",
+    "MIN_BALANCE",
+)
+
+
 @pytest.fixture
 def env(monkeypatch):
-    for name in (
-        "YNAB_ACCOUNT_ID_CC",
-        "YNAB_ACCOUNT_ID_NO_CC",
-        "YNAB_ACCOUNT_ID",
-        "MIN_BALANCE",
-    ):
+    """A minimal valid environment: token, Apprise URL and one account."""
+    for name in SETTINGS_VARIABLES:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("YNAB_API_TOKEN", "test-token")
+    monkeypatch.setenv("APPRISE_URLS", "json://localhost")
+    monkeypatch.setenv("YNAB_ACCOUNT_ID_CC", "a")
     return monkeypatch
+
+
+def refusals(capsys):
+    """Load the settings, expecting a refusal; returns the error lines printed."""
+    with pytest.raises(SystemExit) as exit_info:
+        monitor.load_settings()
+    assert exit_info.value.code == 1
+    return capsys.readouterr().err.splitlines()
 
 
 def test_new_format_sets_cc_per_variable(env):
     env.setenv("YNAB_ACCOUNT_ID_CC", "a:100")
     env.setenv("YNAB_ACCOUNT_ID_NO_CC", "b")
-    accounts = monitor.parse_account_configs()
+    accounts = monitor.load_settings().accounts
     assert [(a.account_id, a.min_balance, a.include_cc) for a in accounts] == [
         ("a", 100, True),
         ("b", 0, False),
@@ -354,9 +391,10 @@ def test_new_format_sets_cc_per_variable(env):
 
 
 def test_legacy_format_uses_min_balance(env):
+    env.delenv("YNAB_ACCOUNT_ID_CC")
     env.setenv("YNAB_ACCOUNT_ID", "a")
     env.setenv("MIN_BALANCE", "250")
-    [account] = monitor.parse_account_configs()
+    [account] = monitor.load_settings().accounts
     assert (account.account_id, account.min_balance, account.include_cc) == (
         "a",
         250,
@@ -364,15 +402,102 @@ def test_legacy_format_uses_min_balance(env):
     )
 
 
-def test_legacy_and_new_format_together_is_refused(env):
+def test_legacy_and_new_format_together_is_refused(env, capsys):
     env.setenv("YNAB_ACCOUNT_ID", "a")
-    env.setenv("YNAB_ACCOUNT_ID_CC", "b")
-    with pytest.raises(SystemExit):
-        monitor.parse_account_configs()
+    assert refusals(capsys) == [
+        "Error: Set YNAB_ACCOUNT_ID_CC/YNAB_ACCOUNT_ID_NO_CC or the older YNAB_ACCOUNT_ID, not both"
+    ]
 
 
-def test_no_accounts(env):
-    assert monitor.parse_account_configs() == []
+def test_legacy_takes_one_account(env, capsys):
+    env.delenv("YNAB_ACCOUNT_ID_CC")
+    env.setenv("YNAB_ACCOUNT_ID", "a,b")
+    [line] = refusals(capsys)
+    assert line.startswith("Error: YNAB_ACCOUNT_ID takes one account ID")
+
+
+@pytest.mark.parametrize("cc", ["", " , "])
+def test_no_accounts_is_refused(env, capsys, cc):
+    env.setenv("YNAB_ACCOUNT_ID_CC", cc)
+    [line] = refusals(capsys)
+    assert line.startswith("Error: No accounts configured")
+
+
+def test_blank_optional_variables_get_their_defaults(env):
+    # Compose passes every optional variable as ${VAR:-}, so unset arrives as "".
+    for name in SETTINGS_VARIABLES[2:]:
+        if name != "YNAB_ACCOUNT_ID_CC":
+            env.setenv(name, "")
+    settings = monitor.load_settings()
+    assert settings.ynab_budget_id == "last-used"
+    assert settings.monitor_days is None
+    assert settings.update_apprise_urls is None
+    assert (settings.schedule, settings.update_schedule) == ("", "")
+    assert settings.accounts[0].min_balance == 0
+
+
+def test_missing_required_variables_are_named(env, capsys):
+    env.delenv("YNAB_API_TOKEN")
+    env.setenv("APPRISE_URLS", " , ")
+    assert refusals(capsys) == [
+        "Error: YNAB_API_TOKEN is required",
+        "Error: APPRISE_URLS: must hold at least one URL",
+    ]
+
+
+def test_every_malformed_value_is_reported_without_secrets(env, capsys):
+    env.setenv("YNAB_API_TOKEN", "  ")
+    env.setenv("UPDATE_APPRISE_URLS", "json://user:hunter2@localhost")
+    env.setenv("MONITOR_DAYS", "ten")
+    env.setenv("MIN_BALANCE", "-1")
+    env.setenv("SCHEDULE", "25:00")
+    env.setenv("UPDATE_SCHEDULE", "0h")
+    lines = refusals(capsys)
+    assert [line.split(":")[1].strip() for line in lines] == [
+        "YNAB_API_TOKEN",
+        "MONITOR_DAYS",
+        "SCHEDULE",
+        "UPDATE_SCHEDULE",
+    ]
+    assert "hunter2" not in "\n".join(lines)
+
+
+def test_min_balance_is_ignored_with_the_new_format(env):
+    # As before Phase 2: MIN_BALANCE belongs to YNAB_ACCOUNT_ID only.
+    env.setenv("MIN_BALANCE", "100.50")
+    [account] = monitor.load_settings().accounts
+    assert account.min_balance == 0
+
+
+def test_bad_min_balance_with_the_legacy_format_is_refused(env, capsys):
+    env.delenv("YNAB_ACCOUNT_ID_CC")
+    env.setenv("YNAB_ACCOUNT_ID", "a")
+    env.setenv("MIN_BALANCE", "100.50")
+    assert refusals(capsys) == ["Error: MIN_BALANCE must be a whole number of dollars"]
+
+
+def test_account_problems_are_reported_with_field_problems(env, capsys):
+    # pydantic skips the model validator when a field fails; load_settings doesn't.
+    env.setenv("MONITOR_DAYS", "ten")
+    env.setenv("YNAB_ACCOUNT_ID", "a")
+    lines = refusals(capsys)
+    assert len(lines) == 2
+    assert lines[0].startswith("Error: MONITOR_DAYS:")
+    assert lines[1].startswith("Error: Set YNAB_ACCOUNT_ID_CC/")
+
+
+def test_settings_reach_the_cycle(env):
+    env.setenv("UPDATE_APPRISE_URLS", "json://updates")
+    env.setenv("MONITOR_DAYS", "0")
+    env.setattr(monitor, "YNAB_API_TOKEN", "")
+    env.setattr(monitor, "MONITOR_DAYS", None)
+    env.setattr(monitor, "APPRISE_URLS", "")
+    env.setattr(monitor, "UPDATE_APPRISE_URLS", "")
+    monitor._apply(monitor.load_settings())
+    assert monitor.YNAB_API_TOKEN == "test-token"
+    assert monitor.MONITOR_DAYS == 0
+    assert monitor.APPRISE_URLS == "json://localhost"
+    assert monitor.UPDATE_APPRISE_URLS == "json://updates"
 
 
 # ---------------------------------------------------------------------------
@@ -395,7 +520,23 @@ def test_parse_schedule(value, expected):
     assert monitor._parse_schedule(value) == expected
 
 
-@pytest.mark.parametrize("value", ["daily", "xh", "8:00:00", "8"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "daily",
+        "xh",
+        "8:00:00",
+        "8",
+        "0h",
+        "-1h",
+        "0.01h",  # cycles back to back
+        "100000000h",  # the next run's date overflows
+        "nanh",
+        "infh",
+        "24:00",
+        "08:60",
+    ],
+)
 def test_parse_schedule_refuses_bad_formats(value):
-    with pytest.raises(SystemExit):
+    with pytest.raises(ValueError, match="invalid schedule"):
         monitor._parse_schedule(value)
