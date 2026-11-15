@@ -15,12 +15,79 @@ Dockhand.
 | Phase | Status | PR | Merge |
 |---|---|---|---|
 | 0 Audit | done (this file) | | |
-| 1 Pipeline (+ uv, ruff, first tests) | done | #10 | by hand |
-| 2 Runtime | done | #13 | by hand, John watches |
-| 3 Boundaries (narrow) | done | #14 | `automerge` |
-| 4 Agent docs | in review | `docs/agent-docs` | `automerge` |
+| 1 Pipeline (+ uv, ruff, first tests) | done, deployed | #10 | `01122b5`, by hand |
+| 2 Runtime | done, deployed | #13 | `4762f68`, by hand, John watched |
+| 3 Boundaries (narrow) | done, deployed | #14 | `6ff2edc`, `automerge` |
+| 4 Agent docs | done, deployed | #15 | `5f6da26`, `automerge` |
 | 5 Design/copy | **n/a**: no UI (notifications only) | | |
-| 6 Stack | out unless John asks (Q7) | | |
+| 6 Stack | out (Q7) | | |
+
+## Close-out (2026-11-15)
+
+The sweep is finished; this plan is final. `main` is at `5f6da26` (#15).
+
+**What landed**
+- **Phase 1 (#10, `01122b5`):** the template `ci.yml` in place of `build.yml` (check, security,
+  image, automerge, close-issues, and the deploy through `dockhand-deploy.yml`), with the
+  hostname comment and the `v*` trigger gone; the image moved to
+  `ghcr.io/john-fleischauer/ynab-balance-monitor`; uv (`pyproject.toml`, `uv.lock`), the ruff
+  fixes and the formatting commit (in `.git-blame-ignore-revs`); the first 49 tests;
+  `python:3.13-slim` with `PYTHONUNBUFFERED=1`; Dependabot, the PR template,
+  `docs/claude-candidates.md`, `.claude/settings.json`, the MIT `LICENSE` and
+  `docs/DECISIONS.md`. gitleaks over the full history and PR text found no leaks. The repo
+  settings are applied: squash only, branches deleted on merge, the `automerge` and
+  `agent-found` labels, Dependabot security updates, secret scanning and push protection.
+- **Dependabot (#11, `d83a28e`):** uv 0.13.8, through the new pipeline.
+- **Phase 2 (#13, `4762f68`):** the non-root `app` user (uid 10001); `GIT_REVISION` in the
+  image and the `starting, revision <sha>` startup line; `.dockerignore`; boot validation with
+  `pydantic-settings`, one `Error:` line per problem and no secret values; compose's
+  `environment:` list with `${VAR:?}` guards on the two secrets, in place of `env_file`; an
+  immediate, clean stop on SIGTERM; `docs/DEPLOYMENT.md`.
+- **Phase 3 (#14, `6ff2edc`):** no Apprise URL in the app's logs, and a filter that masks
+  secrets in library log lines; a 30 s timeout on every YNAB request; `ynab_get` raises instead
+  of exiting; one handler per check, so a failed check is logged and notified and the scheduled
+  loop carries on; retries, failure and recovery notices, the Apprise boot check, the 45 s stop
+  grace and the heartbeat in retry waits (John's decisions, below). 141 tests. `/code-review`
+  ran three times on the PR.
+- **Phase 4 (#15, `5f6da26`):** CLAUDE.md per the triage (D1–D3 dropped, M1–M9 moved, C1 and
+  C2 kept), `docs/ARCHITECTURE.md`, the README rewritten, `.env.example` with every variable,
+  and `AGENTS.md`. A fresh reviewer fact-checked them against the code.
+
+**How each deploy was verified.** Each merge's `main` run (a push for #10 and #13, the
+merge-on-green dispatch for #14 and #15) built the image, and its deploy job got `success:
+true` from Dockhand. Then, on the host: after #13, #14 and #15, the container's
+`org.opencontainers.image.revision` label and its `starting, revision` log line both showed
+that merge commit, it ran as uid 10001 and it was healthy. After #10, the label showed the
+merge commit and the container was healthy; the startup line and the non-root user only came
+with Phase 2.
+
+**John's later decisions in Phase 3** (on #14, after the plan's Q10; recorded in
+`docs/DECISIONS.md`, with the exact behaviour in `docs/DEPLOYMENT.md` § When a check fails):
+- Retry network errors, HTTP 5xx and 429 after 60 s, then 300 s, within a 6-minute budget per
+  check. Any other 4xx fails at once.
+- Honour a 429's `Retry-After`, capped at 300 s; a longer ask fails the check at once.
+- Notify on the first failure, again when the kind of failure changes or the last notice
+  wasn't sent, and once on recovery.
+- Check the Apprise URLs at boot: one that doesn't load fails the boot.
+- `stop_grace_period: 45s` in compose.
+- Write the heartbeat during retry waits.
+
+**Gaps left open** (not filed as issues):
+- The boot check and the notifier each load the Apprise URLs, so they're loaded twice.
+- URL parts under 6 characters aren't masked in library log lines.
+- A 503 ignores `Retry-After`; only a 429 reads it.
+- `/security-review` couldn't run from the orchestrating session, so Phase 3's security review
+  was done by hand against `security.md` (as were Phases 1 and 2).
+
+**John's open items**
+- Make the GHCR package `ghcr.io/john-fleischauer/ynab-balance-monitor` public (Q3).
+- Delete the previous owner's package now that the new image is serving (Q3).
+- Decide whether to promote the 2026-11-15 compose-environment candidate in
+  `docs/claude-candidates.md`.
+- Issue #12, the month-end recurrence drift (`agent-found`).
+
+No branch is left over: `main` is the only branch, local and on GitHub, and there's no
+`docs/HANDOFF.md` to delete.
 
 ## The audit
 

@@ -46,3 +46,35 @@ repointing the stack at the same time. Rejected: renaming in the sweep.
 
 The `ruff format` commit is listed in `.git-blame-ignore-revs`. The Phase 1 PR that holds it is
 merged with a merge commit, not squashed, so that commit's SHA reaches `main` unchanged.
+
+## 2026-11-15 — A failed check is retried, notified once per kind, and recovered from
+
+John's answers on the Phase 3 PR (#14), after the audit's Q10. The exact behaviour is in
+`docs/DEPLOYMENT.md` (§ When a check fails, § Stopping); this entry records the choices.
+
+- **Retries within the check.** A network error, HTTP 5xx or 429 is retried after 60 s, then
+  300 s, from one 6-minute budget per check; any other 4xx fails at once. Before, any YNAB
+  error exited the container, and with a daily schedule that day's check was lost. A retry
+  can't fix a revoked token, so that fails at once.
+- **`Retry-After` on a 429** sets the wait, capped at 300 s and within the budget; a longer ask
+  fails the check. YNAB allows 200 requests an hour, so a longer wait belongs to the next run.
+  Only a 429 reads the header; a 503 gets the fixed waits.
+- **Notices.** The first failure is notified, then again when the kind changes (so a revoked
+  token mid-outage isn't muted) or when the last notice couldn't be sent (so no failure goes
+  unheard); the first check that finishes after a notified failure sends one recovery notice.
+  The state is in memory, so a restart resets it.
+- **Apprise URLs are checked at boot**: one that doesn't load fails the boot, named by variable
+  and entry number, instead of showing up only when a notice is due.
+- **`stop_grace_period: 45s`**: a stop lets the one YNAB request in flight finish, and it can
+  take up to 30 s; Docker's default is 10 s.
+- **The heartbeat is written during retry waits** (see the liveness entry above): a wait is a
+  planned pause of up to 6 minutes, while a hung request must still go stale.
+
+Rejected: exiting on a YNAB error (the old behaviour); keeping the scheduling loop as the only
+heartbeat writer and widening the healthcheck window to the worst-case check.
+
+## 2026-11-15 — The standards sweep is closed
+
+Phases 0–4 are done and deployed (#10, #13, #14, #15); Phase 5 doesn't apply (no UI) and
+Phase 6 is out of scope. What landed, how each deploy was checked, the gaps left open and
+John's open items are in `docs/plans/standards-conformance.md` § Close-out.
