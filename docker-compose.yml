@@ -1,8 +1,8 @@
 services:
   monitor:
-    # Built and pushed to GHCR by GitHub Actions (.github/workflows/build.yml).
+    # Built and pushed to GHCR by GitHub Actions (.github/workflows/ci.yml).
     # Compose only pulls; there is deliberately no build: block.
-    image: ${APP_IMAGE:-ghcr.io/ki4hrg/ynab-balance-monitor:main}
+    image: ${APP_IMAGE:-ghcr.io/john-fleischauer/ynab-balance-monitor:main}
     pull_policy: always
     env_file: .env
     restart: unless-stopped
