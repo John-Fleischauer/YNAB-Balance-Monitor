@@ -56,8 +56,8 @@ with a readable error, never printing a value. A blank value counts as unset.
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
 | `YNAB_API_TOKEN` | **yes** (compose guard) | | YNAB personal access token. Secret |
-| `APPRISE_URLS` | **yes** (compose guard) | | Comma-separated Apprise URLs for alerts. Secret: they carry credentials |
-| `UPDATE_APPRISE_URLS` | no | `APPRISE_URLS` | Apprise URLs for routine updates. Secret |
+| `APPRISE_URLS` | **yes** (compose guard) | | Apprise URLs for alerts, separated by commas, semicolons or spaces. Each must load in Apprise at boot. Secret: they carry credentials |
+| `UPDATE_APPRISE_URLS` | no | `APPRISE_URLS` | Apprise URLs for routine updates, same format and boot check. Secret |
 | `YNAB_ACCOUNT_ID_CC` | one account form | | `id:threshold,id2:threshold`; CC payments counted. Threshold in whole dollars, default 0 |
 | `YNAB_ACCOUNT_ID_NO_CC` | one account form | | Same format; CC payments not counted |
 | `YNAB_ACCOUNT_ID` | one account form | | Older form: one account ID, CC payments counted |
@@ -72,7 +72,8 @@ with a readable error, never printing a value. A blank value counts as unset.
 
 Accounts: set `YNAB_ACCOUNT_ID_CC` and/or `YNAB_ACCOUNT_ID_NO_CC`, **or** `YNAB_ACCOUNT_ID`;
 both forms together, neither, or a malformed entry fails the boot. The stack runs with a
-`SCHEDULE`: the healthcheck reads the heartbeat that only the scheduling loop writes.
+`SCHEDULE`: the healthcheck reads the heartbeat that only the scheduling loop and its retry
+waits write.
 
 The image sets `GIT_REVISION` and `PYTHONUNBUFFERED`; the stack doesn't.
 
@@ -96,5 +97,57 @@ on `main`, or every later deploy keeps running the pinned image.
 
 In scheduled mode, once the scheduler is running, `docker stop` (SIGTERM) ends its wait at
 once: the log says `Shutting down...` and the process exits 0. A check already running
-finishes first. A stop during startup, or in run-once mode, takes Python's default action
-(exit 143, no log line); that's not a fault.
+makes no further YNAB request: it stops after the one in progress, or at once if it's waiting
+to retry, with no failure notification. Compose gives the stop 45 s (`stop_grace_period`), not
+Docker's default 10 s, because that one request can take up to 30 s. In run-once mode a stop ends the check where it is: the log says `Stopped
+before the check finished`, the process exits 143 and no failure notification goes out (a
+notification already being sent finishes or times out first: Apprise sends from a thread). A
+stop during startup takes Python's default action (exit 143, no log line); that's not a
+fault.
+
+## When a check fails
+
+A network error, or HTTP 5xx or 429 from YNAB, is retried within the check: after 60 s, then
+after 300 s, each retry logged (`<reason>; retrying in 60 s`). The waits share one budget of
+6 minutes for the whole check. Any other 4xx (a revoked token is 401) or an unexpected reply
+fails at once.
+
+A 429 with a `Retry-After` header (seconds or an HTTP date) waits that long instead, logged as
+`retrying in <n> s (YNAB's Retry-After)`. If it asks for more than 300 s, or more than the
+check's budget has left, the check fails at once (`YNAB asked for a <n> s wait, more than this
+check can wait`) and is notified as usual: YNAB's limit is 200 requests an hour, so waiting
+longer belongs to the next run. A missing or unreadable header, or a date that isn't in the future (clock skew), gets the
+normal waits. Only the
+parsed number of seconds is logged, never the header itself.
+
+In scheduled mode a retry wait writes the heartbeat at its start and every minute, so a long
+retry doesn't trip the healthcheck's 10-minute window. Requests themselves don't: a hung one
+still lets the heartbeat go stale, though each gives up after 30 s.
+
+A failed check (retries used up, another YNAB error, or a bug) ends that check, not the
+container. The log gets one `Check failed: <reason>` line. In scheduled mode the loop then
+waits for the next run; run-once mode exits 1 instead.
+
+The first failure in a row is notified: the `APPRISE_URLS` services get a "YNAB Balance
+Monitor failed" notification with the reason. Later failures of the same kind only log `Check
+still failing (<n> in a row); not notified again`. A different kind (a network error, then
+HTTP 401) is notified again, and so is the next failure if the last notification couldn't be
+sent. The first check that finishes after a notified failure sends one "YNAB Balance Monitor
+working again" notification. This state lives in memory: a restart starts again, so the first
+failure after a restart is notified even if the one before it was too. If a failure or
+recovery notification can't be sent, the log says `Could not send the failure notification`
+(or `recovery`) and the loop carries on.
+
+Each YNAB request gives up after 30 s without a reply (`YNAB_TIMEOUT` in `monitor.py`), so a
+hung connection fails the check instead of blocking it. Apprise's services use Apprise's own
+timeouts (4 s to connect and per read).
+
+No log line or notification of the app's own holds the YNAB token, an Apprise URL or any part
+of one, or an account or budget ID. An Apprise URL that doesn't load fails the boot, named
+by its variable and entry number only (`Error: APPRISE_URLS: entry 2 doesn't load in Apprise;
+check its format`). Entries are counted as Apprise's own parser splits the list (commas,
+semicolons or whitespace before the next `scheme://`, so a comma inside a URL stays in it),
+with blanks skipped. Apprise's logging is off while the
+URLs are checked, since it logs a URL it can't load. In the log lines of Apprise
+and other libraries, the token, each URL and each part of a URL 6 characters or longer are
+masked as `***`, tracebacks included; a shorter part (a 5-character password) isn't.

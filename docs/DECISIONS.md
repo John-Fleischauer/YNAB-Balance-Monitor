@@ -33,8 +33,9 @@ can't check the running revision. The Dockhand stack has Force redeploy and Re-p
 so `success: true` means a real redeploy, and a skipped redeploy still fails the job. After a
 deploy, the revision is checked by hand from the container's
 `org.opencontainers.image.revision` label (and, from Phase 2, the startup log line). Liveness is
-the compose healthcheck on a heartbeat file that only the scheduling loop touches. Rejected: an
-HTTP server only for the check.
+the compose healthcheck on a heartbeat file that only the scheduling loop touches (and, from
+Phase 3, its retry waits: a planned pause, not a hang). Rejected: an HTTP server only for the
+check.
 
 ## 2026-11-14 — `docker-compose.yml` keeps its name
 

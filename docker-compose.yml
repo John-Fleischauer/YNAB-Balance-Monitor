@@ -28,6 +28,9 @@ services:
       # never present-but-empty in the container.
       TZ: ${TZ:-UTC}
     restart: unless-stopped
+    # docker stop lets a running scheduled check finish its YNAB request in progress,
+    # which can take up to 30 s (YNAB_TIMEOUT). The default 10 s would SIGKILL it.
+    stop_grace_period: 45s
     # Heartbeat written by the scheduling loop (scheduled mode only).
     # In run-once mode the process exits after one run and this check does not apply.
     healthcheck:
