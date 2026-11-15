@@ -33,6 +33,15 @@ def notifications(monkeypatch):
     return sent
 
 
+@pytest.fixture(autouse=True)
+def fresh_state(monkeypatch):
+    """Each test starts with no failures counted, no retries left and a plain sleep;
+    monkeypatch puts back whatever a test (or main()) changes."""
+    monkeypatch.setattr(monitor, "_failures_in_a_row", 0)
+    monkeypatch.setattr(monitor, "_retries_left", [])
+    monkeypatch.setattr(monitor, "_retry_wait", monitor._sleep)
+
+
 @pytest.fixture
 def signal_handlers():
     """Put SIGTERM and SIGINT back as they were: run-once mode replaces them."""
@@ -49,11 +58,11 @@ def signal_handlers():
 
 @pytest.mark.parametrize("variable", ["APPRISE_URLS", "UPDATE_APPRISE_URLS"])
 def test_load_failure_names_the_entry_not_the_url(capsys, variable):
-    notifier = monitor._build_notifier(f"json://localhost, ,{BAD_URL}", variable)
+    notifier = monitor._build_notifier(f"json://localhost, ;{BAD_URL}", variable)
     assert len(notifier) == 1
     err = capsys.readouterr().err
-    # Entry 3: the blank entry still counts, so the number matches the variable.
-    assert f"Apprise: {variable} entry 3 failed to load" in err
+    # Entry 2: blank entries between separators don't count, as at boot.
+    assert f"Apprise: {variable} entry 2 failed to load" in err
     assert "SECRET" not in err
     assert "tgram" not in err
 
@@ -341,7 +350,10 @@ def test_the_scheduled_loop_survives_a_failed_cycle(main_env, notifications):
     main_env.setattr(monitor, "run_cycle", run_cycle)
     monitor.main()
     assert len(cycles) == 2
-    assert len(notifications) == 1
+    assert [n["title"] for n in notifications] == [
+        "YNAB Balance Monitor failed",
+        "YNAB Balance Monitor working again",
+    ]
     assert "Network error fetching accounts: down" in notifications[0]["body"]
 
 
@@ -375,3 +387,229 @@ def test_run_once_stop_skips_the_failure_notification(
     assert exit_info.value.code == 128 + signal.SIGTERM
     assert notifications == []
     assert "Stopped before the check finished" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Retries inside a cycle
+# ---------------------------------------------------------------------------
+
+
+def flaky_urlopen(monkeypatch, *errors):
+    """urlopen raising each of `errors` in turn (None answers), then answering."""
+    queue = list(errors)
+    calls = []
+
+    def fake_urlopen(request, timeout=None):
+        calls.append(timeout)
+        error = queue.pop(0) if queue else None
+        if error:
+            raise error
+        return FakeResponse(json.dumps({"data": {"ok": 1}}).encode())
+
+    monkeypatch.setattr(monitor, "urlopen", fake_urlopen)
+    return calls
+
+
+@pytest.fixture
+def waits(monkeypatch):
+    """Record each retry wait instead of sleeping; no stop is requested."""
+    seen = []
+    monkeypatch.setattr(monitor, "_retry_wait", lambda s: seen.append(s) or False)
+    monkeypatch.setattr(monitor, "_retries_left", list(monitor.RETRY_WAITS))
+    return seen
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        URLError(OSError("Name or service not known")),
+        TimeoutError("timed out"),
+        ConnectionResetError("reset"),
+        http_error(503, b""),
+        http_error(429, b'{"error": {"name": "too_many_requests"}}'),
+    ],
+)
+def test_network_errors_5xx_and_429_are_retried(monkeypatch, capsys, waits, error):
+    calls = flaky_urlopen(monkeypatch, error, error)
+    assert monitor.ynab_get("/budgets/b/accounts", "accounts") == {"ok": 1}
+    assert len(calls) == 3
+    assert waits == [60, 300]
+    err = capsys.readouterr().err
+    assert "; retrying in 60 s" in err
+    assert "; retrying in 300 s" in err
+    assert "/budgets/b" not in err
+
+
+def test_retries_give_up_after_the_last_wait(monkeypatch, waits):
+    error = http_error(502, b"")
+    calls = flaky_urlopen(monkeypatch, error, error, error)
+    with pytest.raises(monitor.YNABError, match="HTTP 502"):
+        monitor.ynab_get("/budgets/b/accounts", "accounts")
+    assert len(calls) == 3
+    assert waits == [60, 300]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [http_error(401, b'{"error": {"name": "unauthorized"}}'), http_error(404, b"")],
+)
+def test_other_4xx_fail_at_once(monkeypatch, waits, error):
+    calls = flaky_urlopen(monkeypatch, error)
+    with pytest.raises(monitor.YNABError):
+        monitor.ynab_get("/budgets/b/accounts", "accounts")
+    assert len(calls) == 1
+    assert waits == []
+
+
+def test_an_unexpected_reply_fails_at_once(monkeypatch, waits):
+    monkeypatch.setattr(
+        monitor, "urlopen", lambda r, timeout=None: FakeResponse(b"not json")
+    )
+    with pytest.raises(monitor.YNABError, match="Unexpected reply"):
+        monitor.ynab_get("/budgets/b/accounts", "accounts")
+    assert waits == []
+
+
+def test_the_retry_budget_is_shared_by_the_cycle(monkeypatch, notifications, waits):
+    # The first request uses the 60 s wait; the second gets only the 300 s one.
+    error = URLError(OSError("down"))
+    calls = flaky_urlopen(monkeypatch, error, None, error, error)
+
+    def run_cycle(accounts, send_update=False):
+        monitor.ynab_get("/budgets/b/accounts", "accounts")
+        monitor.ynab_get("/budgets/b/categories", "categories")
+
+    monkeypatch.setattr(monitor, "run_cycle", run_cycle)
+    assert monitor.run_guarded_cycle([]) is False
+    assert waits == [60, 300]
+    assert len(calls) == 4
+    assert "Network error fetching categories: down" in notifications[0]["body"]
+
+
+def test_a_stop_during_a_retry_wait_ends_the_cycle_unreported(
+    monkeypatch, capsys, notifications
+):
+    monkeypatch.setattr(monitor, "_retry_wait", lambda seconds: True)  # stop requested
+    flaky_urlopen(monkeypatch, URLError(OSError("down")))
+    monkeypatch.setattr(
+        monitor,
+        "run_cycle",
+        lambda accounts, send_update=False: monitor.ynab_get("/b", "accounts"),
+    )
+    with pytest.raises(monitor._Stopped):
+        monitor.run_guarded_cycle([])
+    assert notifications == []
+    assert monitor._failures_in_a_row == 0
+    assert "Check failed" not in capsys.readouterr().err
+
+
+def test_a_stop_during_a_retry_wait_ends_the_scheduled_loop(
+    main_env, capsys, notifications
+):
+    main_env.setenv("SCHEDULE", "1h")
+
+    class FakeStop:
+        requested = False
+
+        def wait(self, seconds):
+            # The retry wait: docker stop arrives during it.
+            self.requested = True
+            return True
+
+    main_env.setattr(monitor, "_Stop", FakeStop)
+    flaky_urlopen(main_env, URLError(OSError("down")))
+    main_env.setattr(
+        monitor,
+        "run_cycle",
+        lambda accounts, send_update=False: monitor.ynab_get("/b", "accounts"),
+    )
+    monitor.main()  # returns: no exception, no exit code
+    out = capsys.readouterr()
+    assert "Shutting down..." in out.out
+    assert "retrying in 60 s" in out.err
+    assert notifications == []
+
+
+# ---------------------------------------------------------------------------
+# Only the first of a run of failures is notified; recovery is
+# ---------------------------------------------------------------------------
+
+
+def test_only_the_first_failure_in_a_row_is_notified(
+    monkeypatch, capsys, notifications
+):
+    outcomes = [monitor.YNABError("down"), monitor.YNABError("down"), None, None]
+
+    def run_cycle(accounts, send_update=False):
+        outcome = outcomes.pop(0)
+        if outcome:
+            raise outcome
+
+    monkeypatch.setattr(monitor, "run_cycle", run_cycle)
+    assert [monitor.run_guarded_cycle([]) for _ in range(4)] == [
+        False,
+        False,
+        True,
+        True,
+    ]
+    assert [n["title"] for n in notifications] == [
+        "YNAB Balance Monitor failed",
+        "YNAB Balance Monitor working again",
+    ]
+    assert notifications[1]["urls"] == monitor.APPRISE_URLS
+    assert notifications[1]["body"] == (
+        "The balance check finished again after 2 failed checks."
+    )
+    assert "Check still failing (2 in a row); not notified again" in (
+        capsys.readouterr().err
+    )
+
+
+def test_a_failed_recovery_notification_is_logged(monkeypatch, capsys):
+    monkeypatch.setattr(monitor, "_failures_in_a_row", 3)
+    monkeypatch.setattr(monitor, "_send_notification", lambda *args: False)
+    monkeypatch.setattr(monitor, "run_cycle", lambda accounts, send_update=False: None)
+    assert monitor.run_guarded_cycle([]) is True
+    assert "Could not send the recovery notification" in capsys.readouterr().err
+    assert monitor._failures_in_a_row == 0
+
+
+# ---------------------------------------------------------------------------
+# Apprise URLs are checked at boot
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("variable", ["APPRISE_URLS", "UPDATE_APPRISE_URLS"])
+def test_an_unloadable_url_fails_the_boot(main_env, capsys, variable):
+    main_env.setenv(variable, f"json://localhost {BAD_URL};discord://SECRET-ID/")
+    with pytest.raises(SystemExit) as exit_info:
+        monitor.load_settings()
+    assert exit_info.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.err.splitlines() == [
+        f"Error: {variable}: entries 2, 3 don't load in Apprise; check their format"
+    ]
+    assert "SECRET" not in captured.out + captured.err
+
+
+def test_one_unloadable_url_is_named_alone(main_env, capsys):
+    main_env.setenv("APPRISE_URLS", f"{BAD_URL},json://localhost")
+    with pytest.raises(SystemExit):
+        monitor.load_settings()
+    assert capsys.readouterr().err.splitlines() == [
+        "Error: APPRISE_URLS: entry 1 doesn't load in Apprise; check its format"
+    ]
+
+
+def test_apprise_logs_nothing_while_urls_are_checked_at_boot(main_env, caplog):
+    main_env.setenv("APPRISE_URLS", BAD_URL)
+    with caplog.at_level(logging.DEBUG), pytest.raises(SystemExit):
+        monitor.load_settings()
+    assert "SECRET" not in caplog.text
+    assert not logging.root.manager.disable  # logging is back on afterwards
+
+
+def test_entry_numbers_agree_everywhere():
+    urls = "json://a ,; json://b\njson://c"
+    assert monitor._split_urls(urls) == ["json://a", "json://b", "json://c"]
+    assert monitor._split_urls(" , ;\t") == []
