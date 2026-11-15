@@ -1,97 +1,180 @@
 # YNAB Balance Monitor
 
-Projects the minimum balance of a checking account through the end of the current month based on scheduled transactions and credit card payment obligations from [YNAB](https://www.ynab.com/). Sends an [ntfy](https://ntfy.sh) alert if the balance is projected to drop below a threshold.
+Projects the lowest balance each of your [YNAB](https://www.ynab.com/) accounts will reach
+by the end of the month, from its scheduled transactions and the money set aside to pay
+your credit cards, and tells you through [Apprise](https://github.com/caronc/apprise)
+(ntfy, Telegram, Discord, email and 100+ more) if it will drop below a threshold.
 
-Useful for keeping most of your cash in a high-yield savings account while making sure your checking account stays funded.
+Useful if you keep most of your cash in a high-yield savings account and want early warning to
+move money into checking.
 
 ## How it works
 
-1. Fetches the current balance of your checking account
-2. Fetches all scheduled transactions for that account within the monitoring window
-3. Fetches credit card payment category balances (money earmarked to pay CC bills)
-4. Deduplicates — scheduled transfers to CC accounts aren't double-counted
-5. Walks day-by-day to find the **minimum projected balance**
-6. If it drops below your threshold, sends an **alert** notification
-7. On the update schedule (if configured), sends a routine **update** notification with the projected minimum regardless of threshold
+On each check, for each account:
+
+1. Fetches its current balance and the budget's scheduled transactions, and expands each
+   recurring one into every date it falls on before the end of the month (or `MONITOR_DAYS`).
+2. For accounts that pay your credit cards: fetches the balances of your credit card payment
+   categories. Card payments already scheduled as transfers are counted on their dates; the
+   rest is taken off today, to be safe.
+3. Walks day by day to the **lowest** projected balance, not just the balance at the end.
+4. If that's below the account's threshold, sends an **alert**. It can also send a routine
+   **update** with the projected minimum (below).
+
+If a check fails (YNAB still unreachable after two retries, a revoked token), it says so in a
+notification. On a schedule it tries again at the next run, and doesn't repeat the notice
+while it keeps failing the same way. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Setup
 
-### 1. Get your YNAB credentials
+### 1. YNAB token and account IDs
 
-- Go to [YNAB Account Settings → Developer Settings](https://app.ynab.com/settings/developer)
-- Create a Personal Access Token
-- Find your account ID:
-  - Visit `https://api.ynab.com/v1/budgets/last-used/accounts?access_token=YOUR_TOKEN` and locate your checking account's `id` or
-  - Choose the account in the sidebar and look at the URL: `https://app.ynab.com/(budget ID)/accounts/(account ID)`  
+- In YNAB, go to [Account Settings → Developer Settings](https://app.ynab.com/settings/developer)
+  and create a personal access token.
+- Find each account's ID: open the account in YNAB and read it from the address bar,
+  `https://app.ynab.com/<budget ID>/accounts/<account ID>`.
 
-### 2. Configure
+### 2. Notifications
+
+`APPRISE_URLS` takes one or more [Apprise URLs](https://github.com/caronc/apprise/wiki),
+separated by commas, semicolons or spaces. For example:
+
+```bash
+APPRISE_URLS=ntfy://ntfy.sh/your-topic
+APPRISE_URLS=tgram://123456789:bot-token/chat-id,discord://webhook-id/webhook-token
+```
+
+Each URL must load in Apprise, or the app refuses to start and says which entry is wrong (by
+number: it never prints the URL). Treat these URLs as secrets: most carry a token.
+
+### 3. Accounts and thresholds
+
+Each account gets a threshold in whole dollars, written `account-id:threshold` (0 if left out).
+List several with commas:
+
+```bash
+# Accounts that pay your credit cards: card payments are counted against them.
+YNAB_ACCOUNT_ID_CC=everyday-checking-id:500
+# Accounts that don't: card payments are ignored.
+YNAB_ACCOUNT_ID_NO_CC=bills-checking-id:100
+```
+
+Each `_CC` account is projected as if it paid every card's balance, so normally only one
+account goes there. To count only some cards, list their payment categories by name or ID in
+`YNAB_CC_CATEGORIES`.
+
+The older form still works for a single account: `YNAB_ACCOUNT_ID=<id>` with
+`MIN_BALANCE=<threshold>` (card payments counted). Use one form or the other, not both.
+
+### 4. Schedule and updates
+
+- `SCHEDULE`: when to check. `08:00` checks daily at 8am (in `TZ`); `6h` checks every 6 hours,
+  starting at once. With both `SCHEDULE` and `UPDATE_SCHEDULE` empty, it checks once and exits.
+- `UPDATE_SCHEDULE`: when to send a routine **update**, in the same format. Each update run is
+  also a full check. Without it, every scheduled check sends an update as well as any alert.
+  A run-once check sends only alerts.
+- `UPDATE_APPRISE_URLS`: where updates go, if not to `APPRISE_URLS` (a quieter channel, say).
+  Alerts and failure notices always go to `APPRISE_URLS`.
+
+Alerts aren't deduplicated: each check that still projects below the threshold alerts again.
+
+### 5. Configure
 
 ```bash
 cp .env.example .env
-# Edit .env with your values
+# Edit .env: every variable is listed there with a comment.
 ```
 
-### 3. Run
+## Running it
 
-**With Docker (recommended):**
+**With Docker** (the image is built by CI and pulled from GHCR):
+
 ```bash
-# Set SCHEDULE in .env (e.g. SCHEDULE=08:00), then:
+# With SCHEDULE set in .env:
 docker compose up -d
+docker compose logs -f
 ```
 
-The container runs as a long-lived service and checks on your configured schedule. Use `docker compose logs -f` to see output.
+The container runs as a long-lived service; its healthcheck expects a schedule.
 
-**Run once (no schedule):**
+**Once, without a schedule** (leave `SCHEDULE` and `UPDATE_SCHEDULE` empty):
+
 ```bash
-# Leave SCHEDULE empty or unset
 docker compose run --rm monitor
 
-# Or without Docker:
-uv run --locked monitor.py   # installs the locked dependencies first
+# Or without Docker, with uv:
+uv run --locked --env-file .env monitor.py
 ```
 
-## Configuration
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `YNAB_API_TOKEN` | Yes | — | YNAB Personal Access Token |
-| `YNAB_ACCOUNT_ID` | Yes | — | ID of the checking account to monitor |
-| `YNAB_BUDGET_ID` | No | `last-used` | Budget ID (or `last-used`) |
-| `YNAB_CC_CATEGORIES` | No | all | Comma-separated category IDs or names to monitor |
-| `MONITOR_DAYS` | No | end of month | Number of days to project forward (leave empty for end of current month) |
-| `MIN_BALANCE` | No | `0` | Alert threshold in dollars |
-| `SCHEDULE` | No | — | `HH:MM` for daily at that time, or `Nh` for every N hours. Empty = run once and exit |
-| `UPDATE_SCHEDULE` | No | — | Same format as `SCHEDULE`. When set, sends a routine balance update notification on this cadence, independent of `SCHEDULE` |
-| `APPRISE_URLS` | Yes | — | Comma-separated [Apprise URLs](https://github.com/caronc/apprise/wiki) for alert notifications |
-| `UPDATE_APPRISE_URLS` | No | `APPRISE_URLS` | Comma-separated Apprise URLs for update notifications. Useful for routing updates to a lower-priority channel |
-| `TZ` | No | `UTC` | Timezone for daily schedule (e.g. `America/New_York`) |
+It exits 0 if the check finished, 1 if it failed or the configuration was refused, and 143
+if stopped.
 
 ## Example output
 
+Made-up accounts and amounts, from a scheduled check with no `UPDATE_SCHEDULE`. Only the
+app's own lines are shown; Apprise also logs a line per send (`apprise: …`):
+
 ```
+YNAB Balance Monitor starting, revision 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b
+Check schedule: daily at 08:00
+Next event in 0.5 hours
 ============================================================
-YNAB Balance Monitor — 2026-02-07 08:00
-Projecting through 2026-02-28, threshold: $500.00
+YNAB Balance Monitor — 2026-03-02 08:00
+Projecting through 2026-03-31, 2 account(s)
 ============================================================
-Account: Primary Checking
-Current balance: $2,450.00
 
-Scheduled transactions through 2026-02-28: 3
-  2026-02-10  Rent                            $ -1,500.00
-  2026-02-14  Paycheck                        $  3,200.00
-  2026-02-28  Car Payment                     $   -450.00
+Credit card payments to account for: $660.00
+  Example Card                    $    520.00
+  Store Card                      $    140.00
 
-Credit card payments to account for: $1,200.00
-  Chase Sapphire                              $    800.00
-  Amex Gold                                   $    400.00
+————————————————————————————————————————
+Account: Everyday Checking
+Current balance: $1,200.00
 
-Unscheduled CC payments (applied today): $1,200.00
+Scheduled transactions through 2026-03-31: 5
+  2026-03-03  Rent (monthly)                            $ -1,450.00
+  2026-03-06  Paycheck (everyOtherWeek)                 $  2,100.00
+  2026-03-12  Transfer : Example Card (monthly)         $   -300.00
+  2026-03-20  Paycheck (everyOtherWeek)                 $  2,100.00
+  2026-03-20  Car Insurance                             $   -180.00
 
-Projected minimum balance: $-250.00 on 2026-02-10
+Unscheduled CC payments (applied today): $360.00
 
-⚠ ALERT: Projected balance drops $750.00 below threshold!
-Notification sent to my-balance-alerts
+Projected minimum balance: $-610.00 on 2026-03-03
+
+⚠ ALERT: Everyday Checking projected balance drops $1,110.00 below threshold!
+
+Alert notification sent via Apprise
+
+Update notification sent via Apprise
+
+————————————————————————————————————————
+Account: Bills Checking
+Current balance: $400.00
+
+Scheduled transactions through 2026-03-31: 1
+  2026-03-15  Internet (monthly)                        $    -95.00
+
+Projected minimum balance: $305.00 on 2026-03-15
+
+✓ Bills Checking stays above $100.00 threshold.
+
+Update notification sent via Apprise
 ```
+
+The notifications from that check:
+
+- **YNAB Balance Alert:** "Your Everyday Checking balance is projected to drop to $-610.00 by
+  Mar 03, 2026. Minimum threshold: $500.00."
+- **YNAB Balance Update:** "Everyday Checking projected minimum: $-610.00 on Mar 03 (through
+  Mar 31, 2026). Threshold: $500.00 — below threshold."
+- **YNAB Balance Update:** "Bills Checking projected minimum: $305.00 on Mar 15 (through Mar 31,
+  2026). Threshold: $100.00 — on track."
+
+## Deploying
+
+How this repo deploys (CI, the image, the Dockhand stack, every variable, rollback, and what
+the logs say when a check fails): [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ## License
 
