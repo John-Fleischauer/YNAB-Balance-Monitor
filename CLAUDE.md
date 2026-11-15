@@ -26,9 +26,7 @@ in `.claude/settings.json`; its `ship` skill is how work lands. How it works:
 - **Unbuffered output.** The Dockerfile keeps `ENV PYTHONUNBUFFERED=1`: without it, `print`
   output doesn't reach `docker logs` until a buffer fills.
 - **Guards.** The app has no inbound entry points; its inputs are the environment and YNAB's
-  replies. A variable reaches the container only if `docker-compose.yml` lists it under
-  `environment:` (there's no `env_file`); the app's own variables are validated by
-  `Settings` at boot.
+  replies, and the app's own variables are validated by `Settings` at boot.
 
 ## Layout
 

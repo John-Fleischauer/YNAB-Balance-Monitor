@@ -7,8 +7,8 @@ the entries below are this repo's exceptions to them.
 ## 2026-11-14 — `monitor.py` stays a single file at the repo root
 
 The Python service profile asks for `src/<package>/` with a console-script entry point. This
-app is one module with one dependency, and the move is Phase 6 (stack) work, which is out of
-scope for the standards sweep. `pyproject.toml` declares no build system and pytest imports
+app is one module with two dependencies (`apprise` and `pydantic-settings`), and the move is
+Phase 6 (stack) work, which is out of scope for the standards sweep. `pyproject.toml` declares no build system and pytest imports
 `monitor` from the root. Rejected: the `src/` layout now, as churn without a gain.
 
 ## 2026-11-14 — Unversioned, though the repo is public

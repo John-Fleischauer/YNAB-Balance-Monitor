@@ -13,8 +13,9 @@ ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never
 
-# Runs as this user, not root. Its home is writable for Apprise's cache; the app
-# writes nothing else but the heartbeat in /tmp, so no other directory is handed to it.
+# Runs as this user, not root. The app writes only the heartbeat in /tmp: Apprise's
+# persistent storage is off unless a path is configured, and none is, so nothing needs
+# the home directory useradd creates. No other directory is handed to the user.
 RUN useradd --system --create-home --uid 10001 app
 
 WORKDIR /app
