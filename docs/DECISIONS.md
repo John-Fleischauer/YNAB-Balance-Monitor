@@ -43,4 +43,5 @@ repointing the stack at the same time. Rejected: renaming in the sweep.
 
 ## 2026-11-14 — Formatting commit
 
-The `ruff format` commit is listed in `.git-blame-ignore-revs`.
+The `ruff format` commit is listed in `.git-blame-ignore-revs`. The Phase 1 PR that holds it is
+merged with a merge commit, not squashed, so that commit's SHA reaches `main` unchanged.

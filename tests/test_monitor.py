@@ -3,7 +3,7 @@
 Nothing here calls YNAB or Apprise; run_cycle's API and notification calls are replaced.
 """
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -90,15 +90,16 @@ def test_monthly_after_window_is_empty():
     assert monitor._expand_occurrences(date(2026, 4, 1), "monthly", START, END) == []
 
 
-def test_monthly_over_a_long_window_clamps():
-    end = date(2026, 6, 30)
-    assert monitor._expand_occurrences(date(2026, 1, 31), "monthly", START, end) == [
-        # Jan 31 -> Feb 28 (clamped), and the walk continues from the 28th.
-        date(2026, 3, 28),
-        date(2026, 4, 28),
-        date(2026, 5, 28),
-        date(2026, 6, 28),
+def test_monthly_clamps_to_a_short_month():
+    start, end = date(2026, 2, 1), date(2026, 2, 28)
+    assert monitor._expand_occurrences(date(2026, 1, 31), "monthly", start, end) == [
+        date(2026, 2, 28)
     ]
+
+
+# Not tested: after one clamp the walk continues from the clamped day (Jan 31 -> Feb 28
+# -> Mar 28), where YNAB would post on Mar 31. That's a known bug, left for its own fix;
+# a test here would pin the wrong dates.
 
 
 def test_next_date_before_window_start_is_skipped():
@@ -145,9 +146,25 @@ def test_long_frequencies_occur_once_in_a_month(frequency):
 # ---------------------------------------------------------------------------
 
 
+TODAY = date(2026, 3, 10)
+
+
+class FixedDatetime(datetime):
+    """datetime with now() frozen at TODAY noon, so no test depends on the clock."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls(TODAY.year, TODAY.month, TODAY.day, 12, 0)
+
+
+@pytest.fixture(autouse=True)
+def frozen_clock(monkeypatch):
+    monkeypatch.setattr(monitor, "datetime", FixedDatetime)
+
+
 @pytest.fixture
 def today():
-    return date.today()
+    return TODAY
 
 
 def test_minimum_is_the_lowest_day_not_the_end(today):

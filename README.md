@@ -47,7 +47,7 @@ The container runs as a long-lived service and checks on your configured schedul
 docker compose run --rm monitor
 
 # Or without Docker:
-uv run monitor.py   # installs the locked dependencies first
+uv run --locked monitor.py   # installs the locked dependencies first
 ```
 
 ## Configuration
